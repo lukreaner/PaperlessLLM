@@ -1125,7 +1125,7 @@ async fn analyze_with_one_repair(
     mut request: AnalysisRequest,
 ) -> AppResult<AnalysisResult> {
     let functions_json = serde_json::to_string(&enabled_functions(profile))?;
-    let diagnostic_provider = diagnostic_provider_kind(&provider.provider_kind);
+    let diagnostic_provider = diagnostic_provider_kind(provider.preset_kind());
     for attempt in 0..=1 {
         let operation = if attempt == 0 { "analysis" } else { "repair" };
         let count_started = Instant::now();
@@ -1202,6 +1202,8 @@ async fn analyze_with_one_repair(
                     api_family: api_family_name(adapter.api_family()).to_owned(),
                     functions_json: functions_json.clone(),
                     input_tokens: count.input_tokens.min(i64::MAX as u64) as i64,
+                    provider_preset: Some(provider.preset_kind().to_owned()),
+                    model: Some(provider.model.clone()),
                 },
             )
             .await?;
@@ -1455,7 +1457,7 @@ async fn record_usage(state: &AppState, attempt: UsageAttempt<'_>) -> AppResult<
     .bind(reservation_id)
     .bind(&job.id)
     .bind(&provider.id)
-    .bind(&provider.provider_kind)
+    .bind(provider.preset_kind())
     .bind(&provider.model)
     .bind(api_family_name(api_family))
     .bind(operation)
@@ -1536,6 +1538,10 @@ fn diagnostic_provider_kind(value: &str) -> &'static str {
         "claude" => "claude",
         "lmstudio" => "lmstudio",
         "custom" => "custom",
+        "mistral" => "mistral",
+        "kimi" => "kimi",
+        "moonshot" => "moonshot",
+        "google" => "google",
         _ => "unknown",
     }
 }
@@ -2580,6 +2586,24 @@ mod tests {
         .execute(state.database.pool())
         .await
         .expect("processing profile");
+
+        // `app::initialize` starts the real worker. Wait until its initial
+        // empty queue pass has reached the idle timer before tests insert
+        // their own jobs or directly exercise the claim gate. Otherwise the
+        // background pass can finish after a test-only manual claim and clear
+        // that published runtime state, making the concurrency assertions
+        // depend on runner scheduling speed.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.worker.runtime_state().await.next_scan_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker reached its initial idle state");
+
         let suggestion = StoredSuggestion {
             current: ReviewSuggestion {
                 title: Some(String::new()),

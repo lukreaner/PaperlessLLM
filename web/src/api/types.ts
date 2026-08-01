@@ -1,4 +1,12 @@
-export type ProviderKind = "openai" | "claude" | "lmstudio" | "custom";
+export type ProviderKind =
+  | "openai"
+  | "claude"
+  | "mistral"
+  | "kimi"
+  | "moonshot"
+  | "google"
+  | "lmstudio"
+  | "custom";
 export type ProviderTransport = "responses" | "chat_completions" | "anthropic_messages";
 export type JobState =
   | "queued"

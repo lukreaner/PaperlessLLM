@@ -1,42 +1,66 @@
 use std::{path::Path, sync::Arc};
 
+#[cfg(not(target_os = "windows"))]
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, OsRng, rand_core::RngCore},
 };
+#[cfg(not(target_os = "windows"))]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use zeroize::Zeroizing;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use sha2::{Digest, Sha256};
 
 use crate::{AppError, AppResult, db::Database};
 
 const MASTER_KEY_FILE: &str = ".master-key";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_SERVICE: &str = "com.paperless-llm.credentials";
 
 #[derive(Clone)]
 pub struct SecretStore {
     database: Database,
+    #[cfg(not(target_os = "windows"))]
     cipher: Arc<Aes256Gcm>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     keychain_prefix: Arc<String>,
 }
 
 impl SecretStore {
     pub async fn new(database: Database, data_dir: &Path) -> AppResult<Self> {
+        #[cfg(target_os = "windows")]
+        harden_legacy_master_key_if_present(data_dir)?;
+        #[cfg(not(target_os = "windows"))]
         let key = load_or_create_master_key(data_dir).await?;
+        #[cfg(not(target_os = "windows"))]
         let cipher = Aes256Gcm::new_from_slice(key.as_slice())
             .map_err(|_| AppError::Internal("invalid credential encryption key".to_owned()))?;
         Ok(Self {
             database,
+            #[cfg(not(target_os = "windows"))]
             cipher: Arc::new(cipher),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             keychain_prefix: Arc::new(keychain_prefix(data_dir)),
         })
     }
 
     pub async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+        #[cfg(target_os = "windows")]
+        {
+            set_keychain(self.keychain_key(key), value.to_owned())
+                .await
+                .map_err(|_| {
+                    AppError::Internal(
+                        "Windows Credential Manager could not store the credential".to_owned(),
+                    )
+                })?;
+            // Remove any encrypted row left by an experimental or restored
+            // installation. Windows never reads this weaker fallback.
+            self.delete_encrypted(key).await?;
+            return Ok(());
+        }
+
         #[cfg(target_os = "macos")]
         if set_keychain(self.keychain_key(key), value.to_owned())
             .await
@@ -46,19 +70,39 @@ impl SecretStore {
             return Ok(());
         }
 
-        self.set_encrypted(key, value).await
+        #[cfg(not(target_os = "windows"))]
+        return self.set_encrypted(key, value).await;
     }
 
     pub async fn get(&self, key: &str) -> AppResult<Option<Zeroizing<String>>> {
+        #[cfg(target_os = "windows")]
+        {
+            return get_keychain(self.keychain_key(key))
+                .await
+                .map(|value| value.map(Zeroizing::new))
+                .map_err(|_| {
+                    AppError::Internal(
+                        "Windows Credential Manager could not read the credential".to_owned(),
+                    )
+                });
+        }
+
         #[cfg(target_os = "macos")]
         if let Ok(Some(value)) = get_keychain(self.keychain_key(key)).await {
             return Ok(Some(Zeroizing::new(value)));
         }
 
-        self.get_encrypted(key).await
+        #[cfg(not(target_os = "windows"))]
+        return self.get_encrypted(key).await;
     }
 
     pub async fn delete(&self, key: &str) -> AppResult<()> {
+        #[cfg(target_os = "windows")]
+        delete_keychain(self.keychain_key(key)).await.map_err(|_| {
+            AppError::Internal(
+                "Windows Credential Manager could not delete the credential".to_owned(),
+            )
+        })?;
         #[cfg(target_os = "macos")]
         {
             let _ = delete_keychain(self.keychain_key(key)).await;
@@ -70,6 +114,7 @@ impl SecretStore {
         Ok(self.get(key).await?.is_some())
     }
 
+    #[cfg(not(target_os = "windows"))]
     async fn set_encrypted(&self, key: &str, value: &str) -> AppResult<()> {
         let mut nonce_bytes = [0_u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
@@ -91,6 +136,7 @@ impl SecretStore {
         Ok(())
     }
 
+    #[cfg(not(target_os = "windows"))]
     async fn get_encrypted(&self, key: &str) -> AppResult<Option<Zeroizing<String>>> {
         let record: Option<(Vec<u8>, Vec<u8>)> =
             sqlx::query_as("SELECT nonce, ciphertext FROM secret_values WHERE key = ?")
@@ -123,18 +169,44 @@ impl SecretStore {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn keychain_key(&self, key: &str) -> String {
         format!("{}:{key}", self.keychain_prefix)
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "windows")]
+fn harden_legacy_master_key_if_present(data_dir: &Path) -> AppResult<()> {
+    let path = data_dir.join(MASTER_KEY_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => crate::private_fs::harden_private_file(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_prefix(data_dir: &Path) -> String {
-    let digest = hex::encode(Sha256::digest(data_dir.to_string_lossy().as_bytes()));
+    let mut digest = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        digest.update(data_dir.as_os_str().as_bytes());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        for unit in canonical.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    let digest = hex::encode(digest.finalize());
     format!("instance:{}", &digest[..16])
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn load_or_create_master_key(data_dir: &Path) -> AppResult<Zeroizing<Vec<u8>>> {
     if let Ok(raw) = std::env::var("PAPERLESSLLM_MASTER_KEY") {
         let bytes = decode_master_key(raw.trim())?;
@@ -161,6 +233,7 @@ async fn load_or_create_master_key(data_dir: &Path) -> AppResult<Zeroizing<Vec<u
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn decode_master_key(raw: &str) -> AppResult<Vec<u8>> {
     let bytes = STANDARD
         .decode(raw)
@@ -178,16 +251,13 @@ fn decode_master_key(raw: &str) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn set_private_file_permissions(path: &Path) -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    }
+    crate::private_fs::harden_private_file(path)?;
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn set_keychain(key: String, value: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &key).map_err(|e| e.to_string())?;
@@ -197,7 +267,7 @@ async fn set_keychain(key: String, value: String) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn get_keychain(key: String) -> Result<Option<String>, String> {
     tokio::task::spawn_blocking(move || {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &key).map_err(|e| e.to_string())?;
@@ -211,7 +281,7 @@ async fn get_keychain(key: String) -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn delete_keychain(key: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &key).map_err(|e| e.to_string())?;
@@ -224,7 +294,7 @@ async fn delete_keychain(key: String) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
 

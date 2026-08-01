@@ -106,6 +106,53 @@ impl OpenAiCompatibleAdapter {
         }
     }
 
+    /// Hosted OpenAI-compatible preset. These providers all use Chat
+    /// Completions, start with conservative capability defaults, and are
+    /// upgraded only by the setup-time capability probe.
+    pub fn hosted_preset(
+        client: Client,
+        kind: ProviderKind,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: String,
+    ) -> Self {
+        debug_assert!(matches!(
+            kind,
+            ProviderKind::Mistral
+                | ProviderKind::Kimi
+                | ProviderKind::Moonshot
+                | ProviderKind::Google
+        ));
+        let mut headers = BTreeMap::new();
+        if kind == ProviderKind::Google {
+            headers.insert(
+                "x-goog-api-client".to_owned(),
+                format!("paperlessllm-oai/{}", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        Self {
+            client,
+            kind,
+            base_url: base_url.into().trim().trim_end_matches('/').to_owned(),
+            api_key: Some(api_key),
+            headers,
+            model: model.into(),
+            transport: CompatibleTransport::ChatCompletions,
+            output_token_field: if matches!(kind, ProviderKind::Kimi | ProviderKind::Moonshot) {
+                ChatOutputTokenField::MaxCompletionTokens
+            } else {
+                ChatOutputTokenField::MaxTokens
+            },
+            capabilities: match kind {
+                ProviderKind::Mistral => ProviderCapabilities::mistral_openai_compatible(),
+                ProviderKind::Google => ProviderCapabilities::google_openai_compatible(),
+                ProviderKind::Moonshot => ProviderCapabilities::moonshot_openai_compatible(),
+                ProviderKind::Kimi => ProviderCapabilities::hosted_openai_compatible(),
+                _ => unreachable!("validated hosted provider preset"),
+            },
+        }
+    }
+
     pub fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
         self.capabilities = capabilities;
         self
@@ -519,5 +566,105 @@ mod tests {
         assert_eq!(adapter.kind(), ProviderKind::LmStudio);
         assert_eq!(adapter.api_family(), ApiFamily::OpenAiResponses);
         assert_eq!(adapter.base_url, "https://lmstudio.example.test/v1");
+    }
+
+    #[test]
+    fn hosted_presets_use_chat_completions_and_safe_sampling_defaults() {
+        for (kind, expected_output_field) in [
+            (ProviderKind::Mistral, ChatOutputTokenField::MaxTokens),
+            (
+                ProviderKind::Kimi,
+                ChatOutputTokenField::MaxCompletionTokens,
+            ),
+            (
+                ProviderKind::Moonshot,
+                ChatOutputTokenField::MaxCompletionTokens,
+            ),
+            (ProviderKind::Google, ChatOutputTokenField::MaxTokens),
+        ] {
+            let adapter = OpenAiCompatibleAdapter::hosted_preset(
+                Client::new(),
+                kind,
+                "https://provider.example/v1/",
+                "entered-model",
+                "secret".to_owned(),
+            );
+            assert_eq!(adapter.kind(), kind);
+            assert_eq!(adapter.api_family(), ApiFamily::OpenAiChatCompletions);
+            assert_eq!(adapter.output_token_field, expected_output_field);
+            assert!(!adapter.capabilities().temperature);
+            assert_eq!(adapter.base_url, "https://provider.example/v1");
+        }
+
+        let kimi = OpenAiCompatibleAdapter::hosted_preset(
+            Client::new(),
+            ProviderKind::Kimi,
+            "https://api.moonshot.ai/v1",
+            "entered-model",
+            "secret".to_owned(),
+        );
+        let mut kimi_request = request();
+        kimi_request.temperature = Some(0.3);
+        let body = build_chat_body(
+            kimi.selected_model(),
+            &kimi_request,
+            kimi.capabilities(),
+            kimi.output_token_field,
+        );
+        assert_eq!(body["max_completion_tokens"], json!(1000));
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+
+        let moonshot = OpenAiCompatibleAdapter::hosted_preset(
+            Client::new(),
+            ProviderKind::Moonshot,
+            "https://api.moonshot.cn/v1",
+            "entered-model",
+            "secret".to_owned(),
+        );
+        let mut moonshot_request = request();
+        moonshot_request.reasoning = Some(ReasoningOptions {
+            effort: Some(ReasoningEffort::Max),
+            budget_tokens: None,
+        });
+        let body = build_chat_body(
+            moonshot.selected_model(),
+            &moonshot_request,
+            moonshot.capabilities(),
+            moonshot.output_token_field,
+        );
+        assert_eq!(body["reasoning_effort"], json!("max"));
+        assert!(
+            !moonshot
+                .capabilities()
+                .supports_reasoning_effort(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn google_preset_identifies_the_client_without_exposing_credentials() {
+        let adapter = OpenAiCompatibleAdapter::hosted_preset(
+            Client::new(),
+            ProviderKind::Google,
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "entered-model",
+            "secret".to_owned(),
+        );
+        assert_eq!(
+            adapter.headers.get("x-goog-api-client"),
+            Some(&format!("paperlessllm-oai/{}", env!("CARGO_PKG_VERSION")))
+        );
+        assert!(!adapter.headers.values().any(|value| value == "secret"));
+        assert!(adapter.capabilities().reasoning_effort);
+        assert!(
+            adapter
+                .capabilities()
+                .supports_reasoning_effort(ReasoningEffort::High)
+        );
+        assert!(
+            !adapter
+                .capabilities()
+                .supports_reasoning_effort(ReasoningEffort::XHigh)
+        );
     }
 }

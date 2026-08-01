@@ -1,8 +1,10 @@
 use std::{
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
 };
 
+use directories::BaseDirs;
 use reqwest::Client;
 use serde_json::Value;
 use tokio::time::sleep;
@@ -26,7 +28,18 @@ enum ServiceHealth {
 /// Start the background service used by the desktop launchers, or reuse the
 /// service already listening at the configured address. The launcher itself
 /// exits after opening the dashboard so a later double-click can reopen it.
-pub async fn launch(mut options: RuntimeOptions) -> AppResult<()> {
+pub async fn launch(options: RuntimeOptions) -> AppResult<()> {
+    let executable = std::env::current_exe()?;
+    launch_with_service_executable(options, &executable).await
+}
+
+/// Launch through an explicit service executable. The Windows GUI-subsystem
+/// launcher is a separate binary, so it uses this entry point to start the
+/// sibling console/service executable without recursively starting itself.
+pub async fn launch_with_service_executable(
+    mut options: RuntimeOptions,
+    service_executable: &Path,
+) -> AppResult<()> {
     if options.port == 0 {
         return Err(AppError::Validation(
             "desktop launch mode requires a fixed, non-zero port".to_owned(),
@@ -55,7 +68,7 @@ pub async fn launch(mut options: RuntimeOptions) -> AppResult<()> {
 
     let log_path = options.data_dir.join("paperless-llm.log");
     validate_desktop_log_paths(&options.data_dir)?;
-    let mut child = spawn_service(&options)?;
+    let mut child = spawn_service(&options, service_executable)?;
     for _ in 0..STARTUP_ATTEMPTS {
         match service_health(&client, &dashboard_url, &instance_id).await {
             ServiceHealth::Matching => {
@@ -164,9 +177,8 @@ async fn service_health(
     }
 }
 
-fn spawn_service(options: &RuntimeOptions) -> AppResult<Child> {
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
+fn spawn_service(options: &RuntimeOptions, service_executable: &Path) -> AppResult<Child> {
+    let mut command = Command::new(service_executable);
     command
         .arg("serve")
         .arg("--data-dir")
@@ -188,7 +200,27 @@ fn spawn_service(options: &RuntimeOptions) -> AppResult<Child> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+        // Keep the long-running console/service executable independent from
+        // the short-lived GUI launcher and prevent a console-window flash.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
     command.spawn().map_err(AppError::from)
+}
+
+pub fn default_data_dir() -> AppResult<PathBuf> {
+    let base = BaseDirs::new().ok_or_else(|| {
+        AppError::Internal("could not determine a user data directory".to_owned())
+    })?;
+    #[cfg(target_os = "macos")]
+    let path = base.data_dir().join("PaperlessLLM");
+    #[cfg(not(target_os = "macos"))]
+    let path = base.data_local_dir().join("paperless-llm");
+    Ok(path)
 }
 
 /// Show a visible startup error when launch mode was entered from Finder or a
@@ -223,6 +255,32 @@ pub async fn show_launch_error(message: &str) {
                 .args(["PaperlessLLM could not start", &message])
                 .status()
                 .await;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL, MessageBoxW,
+        };
+
+        let message = std::ffi::OsStr::new(&message.replace('\0', "�"))
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let caption = std::ffi::OsStr::new("PaperlessLLM could not start")
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both buffers are valid, NUL-terminated UTF-16 and remain
+        // alive until the modal call returns.
+        unsafe {
+            MessageBoxW(
+                ptr::null_mut(),
+                message.as_ptr(),
+                caption.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL,
+            );
         }
     }
 }

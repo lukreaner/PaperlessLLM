@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{path::Path, time::Duration};
 
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{
@@ -20,7 +20,10 @@ impl Database {
         }
         prepare_private_database_file(path)?;
 
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+        // Passing the path directly avoids URL parsing ambiguities for Windows
+        // drive letters, backslashes, spaces, and non-Unicode filenames.
+        let options = SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
@@ -85,47 +88,31 @@ impl Database {
     }
 }
 
-#[cfg(unix)]
 fn prepare_private_database_file(path: &Path) -> AppResult<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    // Creating the database ourselves applies a private mode from its first
-    // inode. Re-applying it also repairs databases created by older releases.
-    let _file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // Creating the database ourselves applies private Unix mode/open flags or
+    // the inherited private Windows ACL from its first filesystem object.
+    // Re-applying permissions also repairs databases restored from backups.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    crate::private_fs::configure_private_open(&mut options, 0o600);
+    let _file = options.open(path)?;
+    crate::private_fs::harden_private_file(path)?;
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn prepare_private_database_file(_path: &Path) -> AppResult<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn harden_sqlite_file_permissions(path: &Path) -> AppResult<()> {
-    use std::{ffi::OsString, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::{ffi::OsString, path::PathBuf};
 
     for suffix in ["", "-wal", "-shm"] {
         let mut candidate: OsString = path.as_os_str().to_owned();
         candidate.push(suffix);
         let candidate = PathBuf::from(candidate);
-        match std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)) {
+        match crate::private_fs::harden_private_file(&candidate) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn harden_sqlite_file_permissions(_path: &Path) -> AppResult<()> {
     Ok(())
 }
 

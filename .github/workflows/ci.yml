@@ -24,10 +24,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -59,7 +59,7 @@ jobs:
 
       - name: Upload browser-test report
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-report
           path: web/playwright-report
@@ -98,24 +98,28 @@ jobs:
             target: aarch64-unknown-linux-musl
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
       - name: Build embedded frontend
         working-directory: web
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
 
       - name: Install musl compiler
         if: runner.os == 'Linux'
@@ -134,8 +138,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Build release binaries
+        run: cargo build --locked --release --bins --target "${{ matrix.target }}"
 
       - name: Run target tests
         run: cargo test --locked --target "${{ matrix.target }}"
@@ -160,6 +164,7 @@ jobs:
           "$bundle/Contents/MacOS/paperless-llm" --help >/dev/null
 
       - name: Smoke test CLI and health endpoint
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -209,6 +214,45 @@ jobs:
               --port 18788 \
               --no-open
           fi
+
+      - name: Smoke test Windows CLI and health endpoint
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          & ".\.github\scripts\smoke-windows.ps1"
+          -Binary "target/${{ matrix.target }}/release/paperless-llm.exe"
+          -GuiBinary "target/${{ matrix.target }}/release/PaperlessLLM.exe"
+          -Target "${{ matrix.target }}"
+
+      - name: Validate Windows release bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadataJson = & cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+              throw "cargo metadata failed with exit code $LASTEXITCODE"
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.name -eq "paperless-llm" })
+          if ($packages.Count -ne 1) {
+              throw "cargo metadata did not return exactly one paperless-llm package"
+          }
+
+          $version = $packages[0].version
+          $outputDirectory = Join-Path $env:RUNNER_TEMP "paperless-llm-windows-package-${{ matrix.target }}"
+          & ".\packaging\windows\create-release-bundle.ps1" `
+              -ConsoleBinary "target/${{ matrix.target }}/release/paperless-llm.exe" `
+              -GuiBinary "target/${{ matrix.target }}/release/PaperlessLLM.exe" `
+              -Version $version `
+              -Architecture "x86_64" `
+              -OutputDirectory $outputDirectory `
+              -License "LICENSE" `
+              -DocumentationDirectory "docs"
+
+          $archive = Join-Path $outputDirectory "paperless-llm-$version-${{ matrix.target }}.zip"
+          & ".\packaging\windows\test-release-bundle.ps1" -Archive $archive
+          & ".\packaging\windows\test-install-lifecycle.ps1" -Archive $archive
 
       - name: Validate Linux desktop installer
         if: runner.os == 'Linux'

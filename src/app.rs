@@ -266,11 +266,7 @@ fn request_log_path<B>(request: &Request<B>) -> &'static str {
 
 pub(crate) async fn ensure_private_data_dir(path: &Path) -> AppResult<()> {
     tokio::fs::create_dir_all(path).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
-    }
+    crate::private_fs::harden_private_directory(path)?;
     Ok(())
 }
 
@@ -287,7 +283,14 @@ pub(crate) fn instance_fingerprint(data_dir: &Path) -> AppResult<String> {
         use std::os::unix::ffi::OsStrExt;
         digest.update(canonical.as_os_str().as_bytes());
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in canonical.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     digest.update(canonical.to_string_lossy().as_bytes());
     digest.update(b"\0");
     digest.update(seed.as_bytes());
@@ -302,18 +305,20 @@ fn load_or_create_instance_seed(data_dir: &Path) -> AppResult<Uuid> {
     let mut invalid_seed = None;
     for _ in 0..ATTEMPTS {
         match std::fs::read_to_string(&path) {
-            Ok(contents) => match Uuid::parse_str(contents.trim()) {
-                Ok(seed) => {
-                    set_private_file_permissions(&path)?;
-                    return Ok(seed);
+            Ok(contents) => {
+                set_private_file_permissions(&path)?;
+                match Uuid::parse_str(contents.trim()) {
+                    Ok(seed) => {
+                        return Ok(seed);
+                    }
+                    Err(error) => {
+                        // A concurrent launcher may have created the file but not
+                        // completed its small write yet.
+                        invalid_seed = Some(error.to_string());
+                        std::thread::sleep(RETRY_DELAY);
+                    }
                 }
-                Err(error) => {
-                    // A concurrent launcher may have created the file but not
-                    // completed its small write yet.
-                    invalid_seed = Some(error.to_string());
-                    std::thread::sleep(RETRY_DELAY);
-                }
-            },
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(seed) = create_instance_seed_atomically(data_dir, &path)? {
                     return Ok(seed);
@@ -338,11 +343,7 @@ fn create_instance_seed_atomically(data_dir: &Path, final_path: &Path) -> AppRes
     let temporary_path = data_dir.join(format!(".paperless-llm.instance.{seed}.tmp"));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    crate::private_fs::configure_private_open(&mut options, 0o600);
     let mut file = options.open(&temporary_path)?;
     writeln!(file, "{seed}")?;
     file.sync_all()?;
@@ -364,22 +365,16 @@ fn create_instance_seed_atomically(data_dir: &Path, final_path: &Path) -> AppRes
 }
 
 fn set_private_file_permissions(path: &Path) -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    crate::private_fs::harden_private_file(path)?;
     Ok(())
 }
 
 fn acquire_data_lock(data_dir: &Path) -> AppResult<File> {
     let path = data_dir.join("paperless-llm.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    crate::private_fs::configure_private_open(&mut options, 0o600);
+    let file = options.open(&path)?;
     set_private_file_permissions(&path)?;
     file.try_lock_exclusive().map_err(|_| {
         AppError::Conflict(
@@ -390,41 +385,82 @@ fn acquire_data_lock(data_dir: &Path) -> AppResult<File> {
 }
 
 pub(crate) async fn open_browser_now(url: &str) -> AppResult<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("cmd");
-        command.args(["/C", "start", url]);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    return Err(AppError::Internal(format!(
-        "open this dashboard URL in a browser: {url}"
-    )));
+    {
+        open_browser_windows(url)
+    }
 
-    let mut child = command.spawn()?;
-    let Ok(status) = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await
-    else {
-        // Some Linux browser launchers remain attached to a newly opened
-        // browser. The dashboard has been handed off successfully, so do not
-        // keep the desktop launcher alive until that browser closes.
-        return Ok(());
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut command = tokio::process::Command::new("open");
+            command.arg(url);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let mut command = tokio::process::Command::new("xdg-open");
+            command.arg(url);
+            command
+        };
+
+        let mut child = command.spawn()?;
+        let Ok(status) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await
+        else {
+            // Some Linux browser launchers remain attached to a newly opened
+            // browser. The dashboard has been handed off successfully, so do
+            // not keep the desktop launcher alive until that browser closes.
+            return Ok(());
+        };
+        let status = status?;
+        if !status.success() {
+            return Err(AppError::Internal(format!(
+                "the browser launcher exited with {status}; open {url} manually"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(AppError::Internal(format!(
+            "open this dashboard URL in a browser: {url}"
+        )))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_browser_windows(url: &str) -> AppResult<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    let operation = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let url = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the operation and URL are NUL-terminated UTF-16 buffers. No
+    // command interpreter is involved; Windows passes the URL directly to the
+    // registered HTTP handler.
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            url.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
     };
-    let status = status?;
-    if !status.success() {
+    let result_code = result as usize;
+    if result_code <= 32 {
         return Err(AppError::Internal(format!(
-            "the browser launcher exited with {status}; open {url} manually"
+            "Windows could not open the default browser (ShellExecute error {result_code})"
         )));
     }
     Ok(())

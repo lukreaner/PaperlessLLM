@@ -114,7 +114,7 @@ export function SetupPage({ onComplete }: { onComplete: () => void }) {
           )}
           {step === 2 && (
             <div className="setup-panel setup-panel--wide">
-              <div className="setup-heading"><span className="eyebrow">Step 3 of 5</span><h2>Choose your AI</h2><p>Use a hosted model or keep inference local with LM Studio. Unsupported options are omitted from requests automatically.</p></div>
+              <div className="setup-heading"><span className="eyebrow">Step 3 of 5</span><h2>Choose your AI</h2><p>Use a hosted provider or keep inference local with LM Studio. Unsupported options are omitted from requests automatically.</p></div>
               <Card><ProviderEditor provider={provider} onChange={setProvider} onSaved={(saved) => { setProvider(saved); app.updateProviders([saved, ...app.providers.filter((item) => item.id !== saved.id)]); }} showActive={false} /></Card>
             </div>
           )}
@@ -171,7 +171,7 @@ function WelcomeStep({ onChoose }: { onChoose: (kind: ProviderKind) => void }) {
       <p>Classify, title, and enrich every document using the AI provider you trust—while staying in control of changes and token usage.</p>
       <div className="welcome-features">
         <div><span>01</span><strong>Conservative by design</strong><p>Existing metadata stays untouched unless you explicitly allow overwrites.</p></div>
-        <div><span>02</span><strong>Any model you choose</strong><p>OpenAI, Claude, LM Studio, and OpenAI-compatible servers.</p></div>
+        <div><span>02</span><strong>Any model you choose</strong><p>OpenAI, Claude, Mistral, Kimi, Moonshot, Google Gemini, LM Studio, and compatible servers.</p></div>
         <div><span>03</span><strong>Know every token</strong><p>Track exact or estimated usage and enforce daily and monthly budgets.</p></div>
       </div>
       <div className="welcome-actions">

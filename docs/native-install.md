@@ -1,6 +1,6 @@
 # Native installation
 
-PaperlessLLM contains one native service executable with the dashboard and database migrations embedded. Release archives also include platform launchers: `PaperlessLLM.app` for macOS and a freedesktop application-menu template and installer for Linux. Node.js, Rust, and a container runtime are not required on the destination computer.
+PaperlessLLM contains one native service executable with the dashboard and database migrations embedded. Release archives also include platform launchers: `PaperlessLLM.app` for macOS, a freedesktop application-menu template and installer for Linux, and a console-free `PaperlessLLM.exe` plus per-user installer for Windows. Node.js, Rust, and a container runtime are not required on the destination computer.
 
 ## Choose and verify a release
 
@@ -12,6 +12,7 @@ Download `SHA256SUMS` and the archive matching the computer from the GitHub rele
 | Intel Mac | `x86_64-apple-darwin.tar.gz` |
 | ARM64 Linux | `aarch64-unknown-linux-musl.tar.gz` |
 | x86-64 Linux | `x86_64-unknown-linux-musl.tar.gz` |
+| x86-64 Windows | `x86_64-pc-windows-msvc.zip` |
 
 Verify the archive before extracting it:
 
@@ -20,6 +21,39 @@ sha256sum --check SHA256SUMS --ignore-missing
 ```
 
 On macOS, use `shasum -a 256` and compare its output with the corresponding line in `SHA256SUMS`.
+
+On Windows, open PowerShell in the download directory and compare the printed hash with the matching `SHA256SUMS` line:
+
+```powershell
+Get-FileHash .\paperless-llm-<version>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+Select-String -Path .\SHA256SUMS -Pattern 'x86_64-pc-windows-msvc.zip'
+```
+
+## Windows
+
+### Double-click installation
+
+Extract the complete ZIP into a normal folder, then double-click **Install PaperlessLLM.cmd**. The installer verifies the two bundled executables against the archive's internal checksum manifest, installs them under `%LOCALAPPDATA%\Programs\PaperlessLLM`, and creates a Start-menu shortcut. It asks whether to create a Desktop shortcut as well. Installation is for the current user and does not require administrator permission.
+
+Choose **PaperlessLLM** from Start or double-click the Desktop shortcut. The console-free `PaperlessLLM.exe` launcher starts or reuses the sibling `paperless-llm.exe` background service and opens the dashboard. A startup problem is shown in a Windows dialog instead of disappearing in a terminal window.
+
+To use the ZIP without installing it, keep `PaperlessLLM.exe` and `paperless-llm.exe` together in the extracted directory and double-click `PaperlessLLM.exe`. Both executables statically link their C runtime, so no separate Microsoft Visual C++ Redistributable installation is required.
+
+The release automation supports optional Authenticode signing. If the maintainers have not configured a signing certificate, Windows may display Microsoft Defender SmartScreen's warning for an unknown publisher. Verify the GitHub Release ZIP checksum before running it; do not disable Defender or other platform protections.
+
+### Command-line operation
+
+The lowercase executable is the normal console and service binary. From PowerShell in the installed directory:
+
+```powershell
+.\paperless-llm.exe --help
+.\paperless-llm.exe launch
+.\paperless-llm.exe serve --open-browser
+```
+
+The default Windows data directory is `%LOCALAPPDATA%\paperless-llm`. PaperlessLLM protects the directory and its private files with a non-inheriting ACL for the owning user, local Administrators, and SYSTEM. Paperless and provider credentials are stored through Windows Credential Manager; Windows deliberately has no encrypted-SQLite/master-key fallback. If Credential Manager is unavailable, saving or reading a credential fails closed with an error.
+
+To upgrade, first use **Quit PaperlessLLM** in the dashboard, extract the newer ZIP, and run its installer again. It replaces only installer-managed application files and shortcuts. Your database, settings, statistics, logs, and credentials remain in the separate data directory.
 
 ## macOS
 
@@ -171,9 +205,9 @@ View logs with `journalctl --user -u paperless-llm.service -f`.
 
 ## Stop PaperlessLLM
 
-Closing the browser does not stop PaperlessLLM; it closes only the dashboard tab while the worker intentionally remains active. To stop a copy started with `launch`, by double-clicking `PaperlessLLM.app`, or from the Linux application menu, open the dashboard and choose **Quit PaperlessLLM** at the bottom of the sidebar. Confirm **Quit PaperlessLLM** in the dialog to stop the worker gracefully. Launch the app again whenever you want to restart it.
+Closing the browser does not stop PaperlessLLM; it closes only the dashboard tab while the worker intentionally remains active. To stop a copy started with `launch`, from a Windows shortcut, by double-clicking `PaperlessLLM.app`, or from the Linux application menu, open the dashboard and choose **Quit PaperlessLLM** at the bottom of the sidebar. Confirm **Quit PaperlessLLM** in the dialog to stop the worker gracefully. Launch the app again whenever you want to restart it.
 
-If the dashboard is unavailable, use macOS Activity Monitor or the Linux system monitor. On Linux, the equivalent terminal fallback is:
+If the dashboard is unavailable, use Windows Task Manager, macOS Activity Monitor, or the Linux system monitor. The long-running Windows process is `paperless-llm.exe`; `PaperlessLLM.exe` is only the short-lived launcher. On Linux, the equivalent terminal fallback is:
 
 ```sh
 pkill -TERM -x paperless-llm
@@ -198,7 +232,7 @@ The API does not send raw log messages to the browser. It maps recognized lines 
 
 The desktop child keeps `paperless-llm.log` below roughly 4 MiB and retains one previous generation as `paperless-llm.log.previous`, so diagnostic storage remains below roughly 8 MiB plus small headers and a lock file. Starting a new desktop service rotates a versioned prior current log instead of deleting it. Both generations and the writer lock are private `0600` files. The dashboard deliberately reads only the current generation, with the newest entries first; it never exposes the previous or temporary rotation file. During the first launch after upgrading, an unversioned legacy log is deleted rather than retained because older output may not meet the current privacy contract. Quit and restart PaperlessLLM once before opening **Logs** after an upgrade.
 
-The dashboard log is intended for instances started through `paperless-llm launch`, the macOS app, or the Linux desktop entry. For launchd-managed instances, inspect the configured `stdout.log` and `stderr.log` files. For systemd-managed instances, continue to use:
+The dashboard log is intended for instances started through `paperless-llm launch`, the Windows launcher, the macOS app, or the Linux desktop entry. For launchd-managed instances, inspect the configured `stdout.log` and `stderr.log` files. For systemd-managed instances, continue to use:
 
 ```sh
 journalctl --user -u paperless-llm.service -f
@@ -217,7 +251,7 @@ To remove a waiting item, expand its Activity row and choose **Remove from queue
 The setup wizard needs:
 
 1. A reachable Paperless-ngx v3 URL and API token. PaperlessLLM checks API v10 compatibility.
-2. An OpenAI, Claude, LM Studio, or custom OpenAI-compatible provider and model.
+2. An OpenAI, Claude, Mistral, Kimi global, Moonshot China, Google Gemini, LM Studio, or custom OpenAI-compatible provider and model. Hosted compatible presets use their official Chat Completions base URL, require an API key, omit temperature by default, and leave the model ID for discovery or manual entry.
 3. Processing mode, enabled AI functions, taxonomy restrictions, and optional trigger tags.
 4. Per-document token limits and any global/provider daily or monthly budgets.
 
@@ -235,5 +269,7 @@ rm "${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.paperlessllm.PaperlessL
 ```
 
 Remove a separately created `PaperlessLLM.desktop` shortcut from the desktop in the usual file-manager way. On Linux, also remove any externally supplied `PAPERLESSLLM_MASTER_KEY` from its credential manager when it is no longer used. Delete the data directory only when its configuration, statistics, and encrypted credentials are no longer needed.
+
+On Windows, uninstall from **Settings → Apps → Installed apps → PaperlessLLM**, or double-click **Uninstall PaperlessLLM.cmd** in `%LOCALAPPDATA%\Programs\PaperlessLLM`. The uninstaller removes only its marked application files, shortcuts, and uninstall entry. It deliberately preserves `%LOCALAPPDATA%\paperless-llm` and Windows Credential Manager values. After stopping and uninstalling every PaperlessLLM instance that uses them, remove those separately only if the configuration, history, statistics, and saved credentials are no longer needed.
 
 On macOS, deleting `PaperlessLLM.app` or its data directory does not delete Keychain-backed credentials. After stopping PaperlessLLM, open **Keychain Access**, search for generic-password entries whose service is `com.paperless-llm.credentials`, and remove only the entries belonging to the PaperlessLLM instance being retired. If other PaperlessLLM data directories are still in use, verify the entry account before deleting it. Then remove the data directory and any plaintext backups only when their configuration, history, fallback credentials, and statistics are no longer needed.

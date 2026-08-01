@@ -5,6 +5,78 @@ use paperless_llm::{
 };
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn provider_preset_migration_preserves_existing_profiles_and_foreign_keys() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("legacy database");
+    sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+        .execute(&pool)
+        .await
+        .expect("initial schema");
+    sqlx::query(
+        "INSERT INTO paperless_connections(id,name,base_url,token_secret_key) \
+         VALUES('paperless','Paperless','http://localhost:8000','token')",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy Paperless connection");
+    sqlx::query(
+        "INSERT INTO provider_profiles(id,name,provider_kind,base_url,model,api_family) \
+         VALUES('legacy','Legacy LM Studio','lmstudio','http://localhost:1234/v1','model','responses')",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy provider");
+    sqlx::query(
+        "INSERT INTO processing_profiles(id,name,paperless_connection_id,provider_profile_id) \
+         VALUES('profile','Default','paperless','legacy')",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy processing profile");
+    sqlx::query(
+        "INSERT INTO budget_reservations(id,provider_profile_id,reserved_tokens,state) \
+         VALUES('legacy-reservation','legacy',80,'reserved')",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy budget reservation");
+
+    sqlx::raw_sql(include_str!("../migrations/0006_provider_presets.sql"))
+        .execute(&pool)
+        .await
+        .expect("provider preset migration");
+    sqlx::raw_sql(include_str!(
+        "../migrations/0007_budget_reservation_provider_identity.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("reservation identity migration");
+
+    let migrated: (String, String) = sqlx::query_as(
+        "SELECT provider_kind,provider_preset FROM provider_profiles WHERE id='legacy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("migrated provider");
+    assert_eq!(migrated, ("lmstudio".to_owned(), "lmstudio".to_owned()));
+    let reservation_identity: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT provider_preset,model FROM budget_reservations WHERE id='legacy-reservation'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("migrated reservation");
+    assert_eq!(reservation_identity, (None, None));
+    let violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .expect("foreign key check");
+    assert!(violations.is_empty());
+}
+
 async fn fixture() -> (TempDir, Database) {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = Database::connect(&directory.path().join("test.db"))
@@ -138,6 +210,7 @@ async fn startup_recovery_full_charges_orphan_reservation_into_usage_history() {
                 api_family: "responses".to_owned(),
                 functions_json: "[]".to_owned(),
                 input_tokens: 30,
+                ..ReservationContext::default()
             },
         )
         .await
@@ -151,16 +224,69 @@ async fn startup_recovery_full_charges_orphan_reservation_into_usage_history() {
         .await
         .unwrap();
     assert_eq!(state, "charged_unknown");
-    let usage: (Option<String>, String, i64, i64, i64, String, String) = sqlx::query_as(
-        "SELECT job_id,operation,input_tokens,output_tokens,total_tokens,usage_source,error_code FROM usage_events WHERE budget_reservation_id=?",
+    let usage: (Option<String>, String, String, String, i64, i64, i64, String, String) = sqlx::query_as(
+        "SELECT job_id,provider_kind,model,operation,input_tokens,output_tokens,total_tokens,usage_source,error_code FROM usage_events WHERE budget_reservation_id=?",
     )
     .bind(&reservation.id)
     .fetch_one(database.pool())
     .await
     .unwrap();
     assert_eq!(usage.0, None);
-    assert_eq!(usage.1, "provider_test");
-    assert_eq!((usage.2, usage.3, usage.4), (30, 50, 80));
-    assert_eq!(usage.5, "reserved_after_unknown");
-    assert_eq!(usage.6, "interrupted_unknown");
+    assert_eq!(usage.1, "lmstudio");
+    assert_eq!(usage.2, "model");
+    assert_eq!(usage.3, "provider_test");
+    assert_eq!((usage.4, usage.5, usage.6), (30, 50, 80));
+    assert_eq!(usage.7, "reserved_after_unknown");
+    assert_eq!(usage.8, "interrupted_unknown");
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_reserved_provider_identity_after_profile_edit() {
+    let (_directory, database) = fixture().await;
+    sqlx::query(
+        "UPDATE provider_profiles SET provider_kind='custom',provider_preset='mistral',model='mistral-old' WHERE id='provider'",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let budget = BudgetService::new(database.clone());
+    let reservation = budget
+        .reserve_attempt(
+            None,
+            "provider",
+            80,
+            &BudgetLimits {
+                timezone: "Europe/Berlin".to_owned(),
+                ..BudgetLimits::default()
+            },
+            &ReservationContext {
+                operation: "provider_test".to_owned(),
+                api_family: "chat_completions".to_owned(),
+                functions_json: "[]".to_owned(),
+                input_tokens: 30,
+                provider_preset: Some("mistral".to_owned()),
+                model: Some("mistral-old".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE provider_profiles SET provider_preset='google',model='gemini-new' WHERE id='provider'",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(budget.reconcile_stale_reservations().await.unwrap(), 1);
+    let usage: (String, String, String) = sqlx::query_as(
+        "SELECT provider_kind,model,api_family FROM usage_events WHERE budget_reservation_id=?",
+    )
+    .bind(&reservation.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(usage.0, "mistral");
+    assert_eq!(usage.1, "mistral-old");
+    assert_eq!(usage.2, "chat_completions");
 }

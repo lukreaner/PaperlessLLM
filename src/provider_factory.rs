@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
+use url::{Host, Url};
 
 use crate::{
     AppError, AppResult,
@@ -8,6 +9,7 @@ use crate::{
     providers::{
         AnthropicMessagesAdapter, ChatOutputTokenField, CompatibleTransport,
         OpenAiCompatibleAdapter, OpenAiResponsesAdapter, ProviderAdapter, ProviderCapabilities,
+        ProviderKind,
     },
     secrets::SecretStore,
 };
@@ -16,23 +18,21 @@ pub async fn build_adapter(
     record: &ProviderProfileRecord,
     secrets: &SecretStore,
 ) -> AppResult<Arc<dyn ProviderAdapter>> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(
-            record.request_timeout_seconds.clamp(5, 1_800) as u64,
-        ))
-        .connect_timeout(Duration::from_secs(20))
-        .user_agent(concat!("PaperlessLLM/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let client = provider_http_client(record.request_timeout_seconds)?;
     let api_key = match record.api_key_secret_key.as_deref() {
         Some(key) => secrets.get(key).await?.map(|value| value.to_string()),
         None => None,
     };
+    validate_provider_secret_transport(
+        &record.base_url,
+        api_key.is_some()
+            || (record.preset_kind() == "custom" && record.headers_secret_key.is_some()),
+    )?;
 
     let transport = match record.api_family.as_str() {
         "responses" => CompatibleTransport::Responses,
         "chat_completions" => CompatibleTransport::ChatCompletions,
-        "messages" if record.provider_kind == "claude" => CompatibleTransport::Responses,
+        "messages" if record.preset_kind() == "claude" => CompatibleTransport::Responses,
         other => {
             return Err(AppError::Validation(format!(
                 "unsupported provider transport: {other}"
@@ -44,7 +44,7 @@ pub async fn build_adapter(
         _ => ChatOutputTokenField::MaxTokens,
     };
 
-    let adapter: Arc<dyn ProviderAdapter> = match record.provider_kind.as_str() {
+    let adapter: Arc<dyn ProviderAdapter> = match record.preset_kind() {
         "openai" => {
             let key = api_key.ok_or_else(|| {
                 AppError::Validation("the OpenAI provider needs an API key".to_owned())
@@ -99,6 +99,23 @@ pub async fn build_adapter(
             }
             Arc::new(apply_compatible_capabilities(adapter, record))
         }
+        preset @ ("mistral" | "kimi" | "moonshot" | "google") => {
+            let key = api_key.ok_or_else(|| {
+                AppError::Validation(format!(
+                    "the {} provider needs an API key",
+                    hosted_preset_label(preset)
+                ))
+            })?;
+            let adapter = OpenAiCompatibleAdapter::hosted_preset(
+                client,
+                hosted_preset_kind(preset),
+                &record.base_url,
+                &record.model,
+                key,
+            )
+            .with_output_token_field(chat_output_token_field);
+            Arc::new(apply_compatible_capabilities(adapter, record))
+        }
         other => {
             return Err(AppError::Validation(format!(
                 "unsupported provider kind: {other}"
@@ -106,6 +123,89 @@ pub async fn build_adapter(
         }
     };
     Ok(adapter)
+}
+
+fn provider_http_client(request_timeout_seconds: i64) -> AppResult<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(
+            request_timeout_seconds.clamp(5, 1_800) as u64
+        ))
+        .connect_timeout(Duration::from_secs(20))
+        // Provider requests carry Bearer credentials and may include arbitrary
+        // user-configured secret headers. Require the configured URL to be the
+        // final destination instead of forwarding either across a redirect.
+        .redirect(Policy::none())
+        .user_agent(concat!("PaperlessLLM/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+pub(crate) fn validate_provider_base_url(raw: &str) -> AppResult<Url> {
+    let url = Url::parse(raw.trim())
+        .map_err(|_| AppError::Validation("provider base URL must be absolute".to_owned()))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(AppError::Validation(
+            "provider base URL must use HTTP or HTTPS".to_owned(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::Validation(
+            "provider base URL must not contain a username or password".to_owned(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(AppError::Validation(
+            "provider base URL must not contain a query or fragment".to_owned(),
+        ));
+    }
+    Ok(url)
+}
+
+pub(crate) fn validate_provider_secret_transport(
+    raw: &str,
+    carries_secrets: bool,
+) -> AppResult<()> {
+    let url = validate_provider_base_url(raw)?;
+    if !carries_secrets || url.scheme() == "https" || provider_host_is_loopback(&url) {
+        return Ok(());
+    }
+    Err(AppError::Validation(
+        "provider API keys and custom secret headers require HTTPS unless the provider is on this computer (localhost, 127.0.0.1, or ::1)"
+            .to_owned(),
+    ))
+}
+
+fn provider_host_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.');
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
+fn hosted_preset_kind(value: &str) -> ProviderKind {
+    match value {
+        "mistral" => ProviderKind::Mistral,
+        "kimi" => ProviderKind::Kimi,
+        "moonshot" => ProviderKind::Moonshot,
+        "google" => ProviderKind::Google,
+        _ => unreachable!("validated hosted provider preset"),
+    }
+}
+
+fn hosted_preset_label(value: &str) -> &'static str {
+    match value {
+        "mistral" => "Mistral",
+        "kimi" => "Kimi",
+        "moonshot" => "Moonshot",
+        "google" => "Google Gemini",
+        _ => "hosted",
+    }
 }
 
 /// Builds an adapter for a one-off capability probe without mutating the
@@ -170,6 +270,10 @@ fn anthropic_api_base(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     #[test]
     fn anthropic_preset_gets_native_api_path() {
@@ -181,5 +285,57 @@ mod tests {
             anthropic_api_base("https://gateway.example/v1/"),
             "https://gateway.example/v1"
         );
+    }
+
+    #[test]
+    fn secret_transport_requires_tls_except_for_loopback_hosts() {
+        for base_url in [
+            "http://localhost:1234/v1",
+            "http://worker.localhost:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:1234/v1",
+            "https://provider.example/v1",
+        ] {
+            validate_provider_secret_transport(base_url, true)
+                .unwrap_or_else(|_| panic!("safe credential destination rejected: {base_url}"));
+        }
+        assert!(validate_provider_secret_transport("http://provider.example/v1", true).is_err());
+        assert!(validate_provider_secret_transport("http://192.0.2.10:1234/v1", true).is_err());
+        assert!(validate_provider_secret_transport("http://provider.example/v1", false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_client_does_not_follow_redirects_with_secret_headers() {
+        let destination = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/credential-capture"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&destination)
+            .await;
+
+        let configured = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                format!("{}/credential-capture", destination.uri()),
+            ))
+            .expect(1)
+            .mount(&configured)
+            .await;
+
+        let response = provider_http_client(30)
+            .expect("provider client")
+            .get(format!("{}/models", configured.uri()))
+            .bearer_auth("must-not-leave-the-configured-server")
+            .header("x-private-provider-header", "also-must-not-leave")
+            .send()
+            .await
+            .expect("redirect response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        destination.verify().await;
+        configured.verify().await;
     }
 }

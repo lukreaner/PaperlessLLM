@@ -33,16 +33,20 @@ jobs:
             target: aarch64-unknown-linux-musl
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - name: Check out release tag
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Validate release version
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -62,19 +66,72 @@ jobs:
             echo "Cargo package version v$crate_version does not match $RELEASE_TAG" >&2
             exit 1
           fi
+          if ! tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"; then
+            echo "Release input does not identify an existing tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "Checked-out commit does not match tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Validate release version on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+              throw "Release tag must be a semantic version beginning with v: $env:RELEASE_TAG"
+          }
+
+          $manifest = Get-Content -LiteralPath "Cargo.toml" -Raw
+          $package = [regex]::Match($manifest, '(?ms)^\[package\]\s*(.*?)(?=^\[|\z)')
+          if (-not $package.Success) {
+              throw "Cargo.toml does not contain a [package] section"
+          }
+
+          $name = [regex]::Match($package.Groups[1].Value, '(?m)^name\s*=\s*"([^"]+)"\s*$')
+          $version = [regex]::Match($package.Groups[1].Value, '(?m)^version\s*=\s*"([^"]+)"\s*$')
+          if (-not $name.Success -or $name.Groups[1].Value -ne "paperless-llm") {
+              throw "Cargo.toml does not describe paperless-llm"
+          }
+          if (-not $version.Success) {
+              throw "Cargo.toml does not contain a package version"
+          }
+          if ("v$($version.Groups[1].Value)" -ne $env:RELEASE_TAG) {
+              throw "Cargo package version v$($version.Groups[1].Value) does not match $env:RELEASE_TAG"
+          }
+
+          $tagRef = 'refs/tags/' + $env:RELEASE_TAG + '^{commit}'
+          $tagCommit = & git rev-parse --verify $tagRef
+          if ($LASTEXITCODE -ne 0) {
+              throw "Release input does not identify an existing tag: $env:RELEASE_TAG"
+          }
+          $tagCommit = $tagCommit.Trim()
+          $headCommit = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+              throw "Could not resolve the checked-out release commit"
+          }
+          $headCommit = $headCommit.Trim()
+          if ($tagCommit -ne $headCommit) {
+              throw "Checked-out commit does not match tag $env:RELEASE_TAG"
+          }
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
       - name: Build embedded frontend
         working-directory: web
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
 
       - name: Install musl compiler
         if: runner.os == 'Linux'
@@ -93,10 +150,11 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build and test
-        run: |
-          cargo test --locked --target "${{ matrix.target }}"
-          cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Run target tests
+        run: cargo test --locked --target "${{ matrix.target }}"
+
+      - name: Build release binaries
+        run: cargo build --locked --release --bins --target "${{ matrix.target }}"
 
       - name: Create and validate macOS app bundle
         if: runner.os == 'macOS'
@@ -114,6 +172,7 @@ jobs:
           "$bundle/Contents/MacOS/paperless-llm" --help >/dev/null
 
       - name: Smoke test CLI and health endpoint
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -163,6 +222,15 @@ jobs:
               --port 18788 \
               --no-open
           fi
+
+      - name: Smoke test Windows CLI and health endpoint
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          & ".\.github\scripts\smoke-windows.ps1"
+          -Binary "target/${{ matrix.target }}/release/paperless-llm.exe"
+          -GuiBinary "target/${{ matrix.target }}/release/PaperlessLLM.exe"
+          -Target "${{ matrix.target }}"
 
       - name: Validate Linux desktop installer
         if: runner.os == 'Linux'
@@ -316,7 +384,152 @@ jobs:
           rm -f "$notary_archive"
           rm -rf "$notary_payload"
 
+      - name: Check optional Windows signing credentials
+        id: windows_credentials
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificateConfigured = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX_BASE64)
+          $passwordConfigured = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
+          if ($certificateConfigured -ne $passwordConfigured) {
+              throw "Configure both WINDOWS_CERTIFICATE_PFX_BASE64 and WINDOWS_CERTIFICATE_PASSWORD, or neither."
+          }
+
+          if ($certificateConfigured) {
+              "signing=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              "Windows Authenticode signing is enabled." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+          else {
+              "signing=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              "Windows Authenticode signing is not configured; this release artifact will be unsigned." |
+                  Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows' && steps.windows_credentials.outputs.signing == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $certificateName = "paperless-llm-signing-$([guid]::NewGuid().ToString('N')).pfx"
+          $certificatePath = Join-Path $env:RUNNER_TEMP $certificateName
+          "PAPERLESS_LLM_WINDOWS_CERTIFICATE=$certificatePath" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $imported = @()
+          try {
+              $certificateBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64)
+              try {
+                  $certificateStream = [IO.File]::Open(
+                      $certificatePath,
+                      [IO.FileMode]::CreateNew,
+                      [IO.FileAccess]::Write,
+                      [IO.FileShare]::None
+                  )
+                  try {
+                      $certificateStream.Write($certificateBytes, 0, $certificateBytes.Length)
+                  }
+                  finally {
+                      $certificateStream.Dispose()
+                  }
+              }
+              finally {
+                  [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
+              }
+
+              $securePassword = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+              $imported = @(Import-PfxCertificate `
+                  -FilePath $certificatePath `
+                  -CertStoreLocation "Cert:\CurrentUser\My" `
+                  -Password $securePassword)
+              $signingCertificates = @($imported | Where-Object { $_.HasPrivateKey })
+              if ($signingCertificates.Count -ne 1) {
+                  throw "The Windows PFX must contain exactly one certificate with a private key."
+              }
+
+              $thumbprint = $signingCertificates[0].Thumbprint
+              "PAPERLESS_LLM_WINDOWS_CERT_THUMBPRINT=$thumbprint" |
+                  Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              Remove-Item -LiteralPath $certificatePath -Force
+          }
+          catch {
+              foreach ($certificate in $imported) {
+                  $certificateStorePath = "Cert:\CurrentUser\My\$($certificate.Thumbprint)"
+                  if (Test-Path -LiteralPath $certificateStorePath) {
+                      if ($certificate.HasPrivateKey) {
+                          Remove-Item -LiteralPath $certificateStorePath -DeleteKey -Force
+                      }
+                      else {
+                          Remove-Item -LiteralPath $certificateStorePath -Force
+                      }
+                  }
+              }
+              Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+              throw
+          }
+
+      - name: Sign and verify Windows executables
+        if: runner.os == 'Windows' && steps.windows_credentials.outputs.signing == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signTool = Get-ChildItem `
+              -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+              -Filter "signtool.exe" `
+              -Recurse `
+              -File |
+              Where-Object { $_.DirectoryName -match '\\x64$' } |
+              Sort-Object -Property FullName -Descending |
+              Select-Object -First 1
+          if ($null -eq $signTool) {
+              throw "A 64-bit Windows SDK signtool.exe was not found on the runner."
+          }
+
+          $binaries = @(
+              "target/${{ matrix.target }}/release/paperless-llm.exe",
+              "target/${{ matrix.target }}/release/PaperlessLLM.exe"
+          )
+          foreach ($binary in $binaries) {
+              & $signTool.FullName sign `
+                  /sha1 $env:PAPERLESS_LLM_WINDOWS_CERT_THUMBPRINT `
+                  /fd SHA256 `
+                  /tr "http://timestamp.digicert.com" `
+                  /td SHA256 `
+                  /v `
+                  $binary
+              if ($LASTEXITCODE -ne 0) {
+                  throw "SignTool failed to sign $binary with exit code $LASTEXITCODE"
+              }
+
+              & $signTool.FullName verify /pa /all /v $binary
+              if ($LASTEXITCODE -ne 0) {
+                  throw "SignTool failed to verify $binary with exit code $LASTEXITCODE"
+              }
+          }
+
+      - name: Remove temporary Windows signing material
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $certificatePath = [Environment]::GetEnvironmentVariable("PAPERLESS_LLM_WINDOWS_CERTIFICATE")
+          $thumbprint = [Environment]::GetEnvironmentVariable("PAPERLESS_LLM_WINDOWS_CERT_THUMBPRINT")
+          if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+              $certificateStorePath = "Cert:\CurrentUser\My\$thumbprint"
+              if (Test-Path -LiteralPath $certificateStorePath) {
+                  Remove-Item -LiteralPath $certificateStorePath -DeleteKey -Force
+              }
+          }
+          if (-not [string]::IsNullOrWhiteSpace($certificatePath)) {
+              Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Create release archive
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -335,11 +548,35 @@ jobs:
           cp -R packaging "$stage/packaging"
           tar -C "$RUNNER_TEMP" -czf "$archive_name.tar.gz" "$archive_name"
 
+      - name: Create Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:RELEASE_TAG.Substring(1)
+          & ".\packaging\windows\create-release-bundle.ps1" `
+              -ConsoleBinary "target/${{ matrix.target }}/release/paperless-llm.exe" `
+              -GuiBinary "target/${{ matrix.target }}/release/PaperlessLLM.exe" `
+              -Version $version `
+              -Architecture "x86_64" `
+              -OutputDirectory "." `
+              -License "LICENSE" `
+              -DocumentationDirectory "docs"
+
+          $archive = "paperless-llm-$version-${{ matrix.target }}.zip"
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+              throw "Windows release builder did not create the expected archive: $archive"
+          }
+          & ".\packaging\windows\test-release-bundle.ps1" -Archive $archive
+          & ".\packaging\windows\test-install-lifecycle.ps1" -Archive $archive
+
       - name: Upload packaged binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.target }}
-          path: paperless-llm-*.tar.gz
+          path: |
+            paperless-llm-*.tar.gz
+            paperless-llm-*.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -359,7 +596,7 @@ jobs:
       contents: write
     steps:
       - name: Download packages
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: package-*
           path: release-artifacts
@@ -368,10 +605,24 @@ jobs:
       - name: Create SHA-256 checksums
         working-directory: release-artifacts
         run: |
-          find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\0' \
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          artifacts=(
+            "paperless-llm-${version}-aarch64-apple-darwin.tar.gz"
+            "paperless-llm-${version}-x86_64-apple-darwin.tar.gz"
+            "paperless-llm-${version}-aarch64-unknown-linux-musl.tar.gz"
+            "paperless-llm-${version}-x86_64-unknown-linux-musl.tar.gz"
+            "paperless-llm-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          for artifact in "${artifacts[@]}"; do
+            test -f "$artifact"
+          done
+          archive_count="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+          test "$archive_count" -eq 5
+          printf '%s\0' "${artifacts[@]}" \
             | sort --zero-terminated \
             | xargs --null sha256sum >SHA256SUMS
-          test "$(wc -l <SHA256SUMS)" -eq 4
+          test "$(wc -l <SHA256SUMS)" -eq 5
 
       - name: Create or update GitHub release
         env:

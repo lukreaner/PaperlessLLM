@@ -29,6 +29,8 @@ pub struct ReservationContext {
     pub api_family: String,
     pub functions_json: String,
     pub input_tokens: i64,
+    pub provider_preset: Option<String>,
+    pub model: Option<String>,
 }
 
 impl Default for ReservationContext {
@@ -38,6 +40,8 @@ impl Default for ReservationContext {
             api_family: "unknown".to_owned(),
             functions_json: "[]".to_owned(),
             input_tokens: 0,
+            provider_preset: None,
+            model: None,
         }
     }
 }
@@ -239,7 +243,7 @@ async fn reserve_in_transaction(
 
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO budget_reservations(id, job_id, provider_profile_id, reserved_tokens, state, operation, api_family, functions_json, input_tokens) VALUES(?, ?, ?, ?, 'reserved', ?, ?, ?, ?)",
+        "INSERT INTO budget_reservations(id, job_id, provider_profile_id, reserved_tokens, state, operation, api_family, functions_json, input_tokens, provider_preset, model) VALUES(?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(job_id)
@@ -249,6 +253,8 @@ async fn reserve_in_transaction(
     .bind(&context.api_family)
     .bind(&context.functions_json)
     .bind(context.input_tokens.clamp(0, requested_tokens))
+    .bind(context.provider_preset.as_deref())
+    .bind(context.model.as_deref())
     .execute(&mut *connection)
     .await?;
     Ok(Reservation {
@@ -269,14 +275,16 @@ struct StaleReservation {
     api_family: String,
     functions_json: String,
     input_tokens: i64,
-    provider_kind: String,
+    provider_preset: String,
     model: String,
 }
 
 async fn reconcile_stale_in_transaction(connection: &mut SqliteConnection) -> AppResult<u64> {
     let reservations: Vec<StaleReservation> = sqlx::query_as(
-        "SELECT r.id,r.job_id,r.provider_profile_id,r.reserved_tokens,r.operation,COALESCE(r.api_family,p.api_family) AS api_family,r.functions_json,r.input_tokens,p.provider_kind,p.model \
-         FROM budget_reservations r JOIN provider_profiles p ON p.id=r.provider_profile_id \
+        "SELECT r.id,r.job_id,r.provider_profile_id,r.reserved_tokens,r.operation,COALESCE(r.api_family,p.api_family,'unknown') AS api_family,r.functions_json,r.input_tokens, \
+                COALESCE(NULLIF(r.provider_preset,''),CASE WHEN p.provider_preset='custom' AND p.provider_kind<>'custom' THEN p.provider_kind ELSE p.provider_preset END,p.provider_kind,'unknown') AS provider_preset, \
+                COALESCE(NULLIF(r.model,''),NULLIF(p.model,''),'unknown') AS model \
+         FROM budget_reservations r LEFT JOIN provider_profiles p ON p.id=r.provider_profile_id \
          WHERE r.state='reserved' ORDER BY r.created_at,r.id",
     )
     .fetch_all(&mut *connection)
@@ -304,7 +312,7 @@ async fn reconcile_stale_in_transaction(connection: &mut SqliteConnection) -> Ap
         .bind(&reservation.id)
         .bind(&reservation.job_id)
         .bind(&reservation.provider_profile_id)
-        .bind(&reservation.provider_kind)
+        .bind(&reservation.provider_preset)
         .bind(&reservation.model)
         .bind(&reservation.api_family)
         .bind(&reservation.operation)

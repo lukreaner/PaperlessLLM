@@ -1,0 +1,61 @@
+PaperlessLLM __VERSION__ for Windows (__ARCHITECTURE__)
+====================================================
+
+QUICK START - PORTABLE
+
+1. Extract the complete ZIP archive to a normal folder.
+2. Double-click PaperlessLLM.exe.
+3. Your browser opens the local PaperlessLLM dashboard.
+
+Keep PaperlessLLM.exe and paperless-llm.exe together. The first is the quiet,
+double-clickable Windows launcher. The second runs the local background service
+and also provides the command-line interface.
+
+The executables include their C runtime and do not require a separate Microsoft
+Visual C++ Redistributable installation.
+
+OPTIONAL PER-USER INSTALLATION
+
+Double-click "Install PaperlessLLM.cmd". It installs PaperlessLLM under your
+Local AppData Programs directory, creates a Start menu shortcut, and asks
+whether to create a Desktop shortcut. It does not require administrator rights.
+
+You can later uninstall it through Windows Settings > Apps, or by running
+"Uninstall PaperlessLLM.cmd" from the installed directory. Uninstalling removes
+only application files and managed shortcuts. It deliberately preserves your
+database, configuration, and logs. Saved credentials remain protected in
+Windows Credential Manager.
+
+SECURITY AND INTEGRITY
+
+The installer verifies both executables against SHA256SUMS before copying them.
+For download verification, compare the ZIP archive with the SHA-256 checksum
+published alongside it on the GitHub release.
+
+Do not place API keys or Paperless tokens in this release folder. Configure
+them only inside the PaperlessLLM dashboard; PaperlessLLM stores them through
+Windows Credential Manager. Do not publish or share your user data directory.
+
+Windows may show a Microsoft Defender SmartScreen warning when an executable is
+not yet signed by a widely trusted publisher. Verify that you downloaded the
+release from the official GitHub repository and that its published SHA-256
+checksum matches before choosing to run it.
+
+COMMAND LINE
+
+Open PowerShell in this directory and run:
+
+  .\paperless-llm.exe --help
+
+The default dashboard address is http://127.0.0.1:8765/ . PaperlessLLM binds to
+localhost unless you explicitly configure LAN mode.
+
+STOP / QUIT
+
+Closing the browser does not stop the local PaperlessLLM service. In the
+dashboard, choose "Quit PaperlessLLM" to shut it down cleanly. If the dashboard
+is unavailable, end paperless-llm.exe in Task Manager; PaperlessLLM.exe is only
+the short-lived launcher.
+
+The docs directory includes native installation, security, release, and
+backup/restore guidance.

@@ -2,7 +2,6 @@ use std::{ffi::OsString, net::IpAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use directories::BaseDirs;
 use paperless_llm::RuntimeOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -42,8 +41,12 @@ struct RuntimeArgs {
 
 impl RuntimeArgs {
     fn options(self, open_browser: bool) -> Result<RuntimeOptions> {
+        let data_dir = match self.data_dir {
+            Some(data_dir) => data_dir,
+            None => paperless_llm::launcher::default_data_dir()?,
+        };
         Ok(RuntimeOptions {
-            data_dir: self.data_dir.unwrap_or(default_data_dir()?),
+            data_dir,
             bind: self.bind,
             port: self.port,
             open_browser,
@@ -180,15 +183,6 @@ fn prepare_cli_arguments(arguments: impl IntoIterator<Item = OsString>) -> Vec<O
         arguments.push(OsString::from("launch"));
     }
     arguments
-}
-
-fn default_data_dir() -> Result<PathBuf> {
-    let base = BaseDirs::new().context("could not determine a user data directory")?;
-    #[cfg(target_os = "macos")]
-    let path = base.data_dir().join("PaperlessLLM");
-    #[cfg(not(target_os = "macos"))]
-    let path = base.data_local_dir().join("paperless-llm");
-    Ok(path)
 }
 
 #[cfg(test)]

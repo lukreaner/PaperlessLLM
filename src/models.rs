@@ -26,6 +26,10 @@ pub enum ProviderKind {
     Claude,
     Lmstudio,
     Custom,
+    Mistral,
+    Kimi,
+    Moonshot,
+    Google,
 }
 
 impl ProviderKind {
@@ -35,6 +39,10 @@ impl ProviderKind {
             Self::Claude => "claude",
             Self::Lmstudio => "lmstudio",
             Self::Custom => "custom",
+            Self::Mistral => "mistral",
+            Self::Kimi => "kimi",
+            Self::Moonshot => "moonshot",
+            Self::Google => "google",
         }
     }
 }
@@ -62,6 +70,7 @@ pub struct ProviderProfileRecord {
     pub id: String,
     pub name: String,
     pub provider_kind: String,
+    pub provider_preset: String,
     pub base_url: String,
     pub model: String,
     pub api_family: String,
@@ -83,6 +92,17 @@ pub struct ProviderProfileRecord {
 }
 
 impl ProviderProfileRecord {
+    pub fn preset_kind(&self) -> &str {
+        // Profiles written by pre-preset code (or imported by an operator)
+        // may receive the additive column's `custom` default. Preserve the
+        // original built-in identity in that case.
+        if self.provider_preset == "custom" && self.provider_kind != "custom" {
+            self.provider_kind.as_str()
+        } else {
+            self.provider_preset.as_str()
+        }
+    }
+
     pub fn capabilities(&self) -> Value {
         serde_json::from_str(&self.capabilities_json)
             .unwrap_or_else(|_| Value::Object(Default::default()))

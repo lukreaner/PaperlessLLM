@@ -1,4 +1,4 @@
-import type { AppSettings, ProviderProfile } from "./types";
+import type { AppSettings, ProviderKind, ProviderProfile } from "./types";
 
 export const defaultSettings: AppSettings = {
   paperless: {
@@ -59,7 +59,7 @@ export const defaultSettings: AppSettings = {
   },
 };
 
-export const providerPresets: Record<"openai" | "claude" | "lmstudio" | "custom", Omit<ProviderProfile, "id">> = {
+export const providerPresets: Record<ProviderKind, Omit<ProviderProfile, "id">> = {
   openai: {
     name: "OpenAI",
     kind: "openai",
@@ -83,6 +83,50 @@ export const providerPresets: Record<"openai" | "claude" | "lmstudio" | "custom"
     active: false,
     temperature: null,
     reasoning_effort: "medium",
+  },
+  mistral: {
+    name: "Mistral",
+    kind: "mistral",
+    base_url: "https://api.mistral.ai/v1",
+    model: "",
+    transport: "chat_completions",
+    chat_output_token_field: "max_tokens",
+    api_key_configured: false,
+    active: false,
+    temperature: null,
+  },
+  kimi: {
+    name: "Kimi (Global)",
+    kind: "kimi",
+    base_url: "https://api.moonshot.ai/v1",
+    model: "",
+    transport: "chat_completions",
+    chat_output_token_field: "max_completion_tokens",
+    api_key_configured: false,
+    active: false,
+    temperature: null,
+  },
+  moonshot: {
+    name: "Moonshot (China)",
+    kind: "moonshot",
+    base_url: "https://api.moonshot.cn/v1",
+    model: "",
+    transport: "chat_completions",
+    chat_output_token_field: "max_completion_tokens",
+    api_key_configured: false,
+    active: false,
+    temperature: null,
+  },
+  google: {
+    name: "Google Gemini",
+    kind: "google",
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    model: "",
+    transport: "chat_completions",
+    chat_output_token_field: "max_tokens",
+    api_key_configured: false,
+    active: false,
+    temperature: null,
   },
   lmstudio: {
     name: "LM Studio",
@@ -108,3 +152,18 @@ export const providerPresets: Record<"openai" | "claude" | "lmstudio" | "custom"
     headers: {},
   },
 };
+
+export const providerPresetOptions: ReadonlyArray<{
+  kind: ProviderKind;
+  label: string;
+  description: string;
+}> = [
+  { kind: "openai", label: "OpenAI", description: "Responses API" },
+  { kind: "claude", label: "Claude", description: "Native Messages API" },
+  { kind: "mistral", label: "Mistral", description: "Hosted Chat Completions" },
+  { kind: "kimi", label: "Kimi (Global)", description: "Global Chat Completions endpoint" },
+  { kind: "moonshot", label: "Moonshot (China)", description: "China Chat Completions endpoint" },
+  { kind: "google", label: "Google Gemini", description: "Gemini Chat Completions" },
+  { kind: "lmstudio", label: "LM Studio", description: "Local model server" },
+  { kind: "custom", label: "Custom compatible", description: "Responses or Chat Completions" },
+];

@@ -8,6 +8,7 @@ pub mod error;
 pub mod launcher;
 pub mod models;
 pub mod paperless;
+mod private_fs;
 pub mod provider_factory;
 pub mod providers;
 pub mod secrets;

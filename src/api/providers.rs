@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, str::FromStr, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    time::Instant,
+};
 
 use axum::http::{HeaderName, HeaderValue};
 use chrono::Utc;
@@ -14,7 +18,10 @@ use crate::{
     app::AppState,
     budget::{BudgetLimits, ReservationContext},
     models::ProviderProfileRecord,
-    provider_factory::{build_adapter, build_adapter_with_capabilities},
+    provider_factory::{
+        build_adapter, build_adapter_with_capabilities, validate_provider_base_url,
+        validate_provider_secret_transport,
+    },
     providers::{
         AnalysisRequest, AnalysisResult, ApiFamily, ProviderAdapter, ProviderCapabilities,
         ProviderError, ReasoningEffort, ReasoningOptions, TokenUsage, UsageSource,
@@ -67,106 +74,196 @@ async fn save(
 ) -> AppResult<ProviderProfileDto> {
     validate(&input)?;
     let api_family = database_transport(&input.kind, &input.transport)?;
-    let previous_profile: Option<(String, String, String, String, String)> = if creating {
+    let provider_kind = database_provider_kind(&input.kind);
+    let chat_output_token_field =
+        compatible_output_token_field(&input.kind, input.chat_output_token_field.as_str());
+    let normalized_base_url = normalize_base_url(&input.base_url);
+    let previous_profile: Option<ProviderProfileRecord> = if creating {
         None
     } else {
-        sqlx::query_as(
-            "SELECT provider_kind,base_url,model,api_family,capabilities_json FROM provider_profiles WHERE id=?",
-        )
-        .bind(id)
-        .fetch_optional(state.database.pool())
-        .await?
+        sqlx::query_as("SELECT * FROM provider_profiles WHERE id=?")
+            .bind(id)
+            .fetch_optional(state.database.pool())
+            .await?
     };
-    let api_key_secret = format!("provider:{id}:api_key");
-    let headers_secret = format!("provider:{id}:headers");
-    if let Some(key) = input
+    if !creating && previous_profile.is_none() {
+        return Err(AppError::NotFound("provider profile not found".to_owned()));
+    }
+    let same_destination = previous_profile.as_ref().is_some_and(|previous| {
+        previous.preset_kind() == input.kind
+            && normalize_base_url(&previous.base_url) == normalized_base_url
+    });
+    let supplied_api_key = input
         .api_key
         .as_deref()
-        .filter(|key| !key.trim().is_empty())
-    {
-        state.secrets.set(&api_key_secret, key.trim()).await?;
-    }
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
     if let Some(headers) = input.headers.as_ref() {
         validate_headers(headers)?;
-        if headers.is_empty() {
-            state.secrets.delete(&headers_secret).await?;
+    }
+    let previous_api_key = previous_profile
+        .as_ref()
+        .and_then(|profile| profile.api_key_secret_key.as_deref());
+    let previous_headers = previous_profile
+        .as_ref()
+        .and_then(|profile| profile.headers_secret_key.as_deref());
+    let retained_api_key = if same_destination && supplied_api_key.is_none() {
+        existing_secret_key(state, previous_api_key).await?
+    } else {
+        None
+    };
+    let retain_headers = input.kind == "custom" && same_destination && input.headers.is_none();
+    let retained_headers = if retain_headers {
+        existing_secret_key(state, previous_headers).await?
+    } else {
+        None
+    };
+
+    if provider_requires_api_key(&input.kind)
+        && supplied_api_key.is_none()
+        && retained_api_key.is_none()
+    {
+        let message = if previous_profile.is_some() && !same_destination {
+            format!(
+                "changing the provider preset or base URL requires entering a new {} API key",
+                provider_label(&input.kind)
+            )
         } else {
-            state
-                .secrets
-                .set(&headers_secret, &serde_json::to_string(headers)?)
-                .await?;
-        }
+            format!("{} requires an API key", provider_label(&input.kind))
+        };
+        return Err(AppError::Validation(message));
     }
-    let api_key_configured = state.secrets.exists(&api_key_secret).await?;
-    if matches!(input.kind.as_str(), "openai" | "claude") && !api_key_configured {
-        return Err(AppError::Validation(format!(
-            "{} requires an API key",
-            if input.kind == "openai" {
-                "OpenAI"
-            } else {
-                "Claude"
-            }
-        )));
-    }
-    let headers_configured = state.secrets.exists(&headers_secret).await?;
+    let carries_custom_headers = input.kind == "custom"
+        && match input.headers.as_ref() {
+            Some(headers) => !headers.is_empty(),
+            None => retained_headers.is_some(),
+        };
+    validate_provider_secret_transport(
+        &normalized_base_url,
+        supplied_api_key.is_some() || retained_api_key.is_some() || carries_custom_headers,
+    )?;
+
+    let serialized_headers = if input.kind == "custom" {
+        input
+            .headers
+            .as_ref()
+            .filter(|headers| !headers.is_empty())
+            .map(serde_json::to_string)
+            .transpose()?
+    } else {
+        None
+    };
     let mut capabilities = input
         .capabilities
         .as_ref()
         .map(capabilities_from_dto)
         .unwrap_or_else(|| default_capabilities(&input.kind, &input.transport));
     if capabilities.reasoning_efforts.is_none()
-        && let Some((kind, base_url, model, family, raw_capabilities)) = previous_profile.as_ref()
-        && kind == &input.kind
-        && base_url == input.base_url.trim().trim_end_matches('/')
-        && model == input.model.trim()
-        && family == api_family
-        && let Ok(previous) = serde_json::from_str::<ProviderCapabilities>(raw_capabilities)
+        && let Some(previous_profile) = previous_profile.as_ref()
+        && previous_profile.preset_kind() == input.kind
+        && normalize_base_url(&previous_profile.base_url) == normalized_base_url
+        && previous_profile.model == input.model.trim()
+        && previous_profile.api_family == api_family
+        && let Ok(previous) =
+            serde_json::from_str::<ProviderCapabilities>(&previous_profile.capabilities_json)
     {
         capabilities.reasoning_efforts = previous.reasoning_efforts;
     }
     let capabilities_json = serde_json::to_string(&capabilities)?;
     let max_output = input.max_output_tokens.unwrap_or(8_000).clamp(1, 200_000) as i64;
 
-    if creating {
+    // Replacement credentials are written under fresh keys. The profile row
+    // continues to reference the old values until its INSERT/UPDATE succeeds,
+    // so a validation or database failure cannot damage the working profile.
+    let staged_api_key = match supplied_api_key {
+        Some(value) => Some(stage_secret(state, id, "api_key", value).await?),
+        None => None,
+    };
+    let staged_headers = match serialized_headers.as_deref() {
+        Some(value) => match stage_secret(state, id, "headers", value).await {
+            Ok(key) => Some(key),
+            Err(error) => {
+                cleanup_staged_secrets(state, staged_api_key.iter()).await;
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    let api_key_secret = staged_api_key.as_deref().or(retained_api_key.as_deref());
+    let headers_secret = staged_headers.as_deref().or(retained_headers.as_deref());
+
+    let persisted = if creating {
         sqlx::query(
-            "INSERT INTO provider_profiles(id,name,provider_kind,base_url,model,api_family,chat_output_token_field,api_key_secret_key,headers_secret_key,capabilities_json,reasoning_effort,temperature,max_output_tokens) \
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO provider_profiles(id,name,provider_kind,provider_preset,base_url,model,api_family,chat_output_token_field,api_key_secret_key,headers_secret_key,capabilities_json,reasoning_effort,temperature,max_output_tokens) \
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(id)
         .bind(input.name.trim())
+        .bind(provider_kind)
         .bind(&input.kind)
-        .bind(input.base_url.trim().trim_end_matches('/'))
+        .bind(&normalized_base_url)
         .bind(input.model.trim())
         .bind(api_family)
-        .bind(&input.chat_output_token_field)
-        .bind(api_key_configured.then_some(api_key_secret.as_str()))
-        .bind(headers_configured.then_some(headers_secret.as_str()))
+        .bind(chat_output_token_field)
+        .bind(api_key_secret)
+        .bind(headers_secret)
         .bind(capabilities_json)
         .bind(input.reasoning_effort.as_deref())
         .bind(input.temperature)
         .bind(max_output)
         .execute(state.database.pool())
-        .await?;
+        .await
     } else {
+        let previous = previous_profile
+            .as_ref()
+            .expect("an update always loaded its previous profile");
         sqlx::query(
-            "UPDATE provider_profiles SET name=?,provider_kind=?,base_url=?,model=?,api_family=?,chat_output_token_field=?,api_key_secret_key=?,headers_secret_key=?,capabilities_json=?,reasoning_effort=?,temperature=?,max_output_tokens=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+            "UPDATE provider_profiles SET name=?,provider_kind=?,provider_preset=?,base_url=?,model=?,api_family=?,chat_output_token_field=?,api_key_secret_key=?,headers_secret_key=?,capabilities_json=?,reasoning_effort=?,temperature=?,max_output_tokens=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE id=? AND provider_kind=? AND provider_preset=? AND base_url=? AND api_key_secret_key IS ? AND headers_secret_key IS ?",
         )
         .bind(input.name.trim())
+        .bind(provider_kind)
         .bind(&input.kind)
-        .bind(input.base_url.trim().trim_end_matches('/'))
+        .bind(&normalized_base_url)
         .bind(input.model.trim())
         .bind(api_family)
-        .bind(&input.chat_output_token_field)
-        .bind(api_key_configured.then_some(api_key_secret.as_str()))
-        .bind(headers_configured.then_some(headers_secret.as_str()))
+        .bind(chat_output_token_field)
+        .bind(api_key_secret)
+        .bind(headers_secret)
         .bind(capabilities_json)
         .bind(input.reasoning_effort.as_deref())
         .bind(input.temperature)
         .bind(max_output)
         .bind(id)
+        .bind(&previous.provider_kind)
+        .bind(&previous.provider_preset)
+        .bind(&previous.base_url)
+        .bind(previous.api_key_secret_key.as_deref())
+        .bind(previous.headers_secret_key.as_deref())
         .execute(state.database.pool())
-        .await?;
+        .await
+    };
+    let persisted = match persisted {
+        Ok(result) => result,
+        Err(error) => {
+            cleanup_staged_secrets(state, staged_api_key.iter().chain(staged_headers.iter())).await;
+            return Err(AppError::Database(error));
+        }
+    };
+    if persisted.rows_affected() != 1 {
+        cleanup_staged_secrets(state, staged_api_key.iter().chain(staged_headers.iter())).await;
+        return Err(AppError::Conflict(
+            "provider profile changed while it was being saved; reload it and try again".to_owned(),
+        ));
     }
+
+    delete_replaced_secrets(
+        state,
+        previous_api_key.into_iter().chain(previous_headers),
+        api_key_secret,
+        headers_secret,
+    )
+    .await?;
 
     if input.active {
         let mut settings = load_settings(state).await?;
@@ -196,6 +293,58 @@ async fn save(
             .await?;
     let active = load_settings(state).await?.active_provider_id;
     to_dto(state, record, active.as_deref()).await
+}
+
+fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    Url::parse(trimmed)
+        .map(|url| url.to_string().trim_end_matches('/').to_owned())
+        .unwrap_or_else(|_| trimmed.to_owned())
+}
+
+async fn existing_secret_key(state: &AppState, key: Option<&str>) -> AppResult<Option<String>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    Ok(state.secrets.exists(key).await?.then(|| key.to_owned()))
+}
+
+async fn stage_secret(state: &AppState, id: &str, field: &str, value: &str) -> AppResult<String> {
+    let key = format!("provider:{id}:{field}:{}", Uuid::new_v4());
+    if let Err(error) = state.secrets.set(&key, value).await {
+        let _ = state.secrets.delete(&key).await;
+        return Err(error);
+    }
+    Ok(key)
+}
+
+async fn cleanup_staged_secrets<'a>(state: &AppState, keys: impl Iterator<Item = &'a String>) {
+    for key in keys {
+        let _ = state.secrets.delete(key).await;
+    }
+}
+
+async fn delete_replaced_secrets<'a>(
+    state: &AppState,
+    previous_keys: impl Iterator<Item = &'a str>,
+    current_api_key: Option<&str>,
+    current_headers: Option<&str>,
+) -> AppResult<()> {
+    let mut deleted = BTreeSet::new();
+    let mut first_error = None;
+    for key in previous_keys {
+        if Some(key) != current_api_key
+            && Some(key) != current_headers
+            && deleted.insert(key.to_owned())
+            && let Err(error) = state.secrets.delete(key).await
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 pub async fn delete(state: &AppState, id: &str) -> AppResult<()> {
@@ -278,8 +427,10 @@ pub async fn test(state: &AppState, id: &str) -> AppResult<ProviderTestResult> {
     // model capability document. Probe strict output with a deliberately
     // conflicting prompt: only an enforced schema can produce `ok: true`.
     // OpenAI/Claude endpoints without model metadata use the same safe probe.
-    let probe_strict = matches!(record.provider_kind.as_str(), "lmstudio" | "custom")
-        || metadata_capabilities.is_none();
+    let probe_strict = matches!(
+        record.preset_kind(),
+        "lmstudio" | "custom" | "mistral" | "kimi" | "moonshot" | "google"
+    ) || metadata_capabilities.is_none();
     let mut strict_probe_rejected = false;
     if probe_strict {
         capabilities.strict_json_schema = true;
@@ -395,6 +546,8 @@ async fn run_test_attempt(
                 api_family: test_api_family(adapter.api_family()).to_owned(),
                 functions_json: "[]".to_owned(),
                 input_tokens: count.input_tokens.min(i64::MAX as u64) as i64,
+                provider_preset: Some(record.preset_kind().to_owned()),
+                model: Some(record.model.clone()),
             },
         )
         .await?;
@@ -522,24 +675,22 @@ fn validate_model_reasoning(
     record: &ProviderProfileRecord,
     capabilities: &ProviderCapabilities,
 ) -> Result<(), String> {
-    if record.provider_kind != "claude" {
-        return Ok(());
-    }
     let Some(raw) = record.reasoning_effort.as_deref() else {
         return Ok(());
     };
     let Some(effort) = ReasoningEffort::parse(raw) else {
-        return Err("unknown Claude reasoning effort".to_owned());
+        return Err("unknown reasoning effort".to_owned());
     };
     if effort == ReasoningEffort::None {
         return Ok(());
     }
-    if effort == ReasoningEffort::Minimal {
+    if record.preset_kind() == "claude" && effort == ReasoningEffort::Minimal {
         return Err("Claude does not support the `minimal` effort level".to_owned());
     }
     if !capabilities.supports_reasoning_effort(effort) {
         return Err(format!(
-            "the selected Claude model does not report support for `{raw}` effort"
+            "the selected model for {} does not report support for `{raw}` reasoning effort",
+            provider_label(record.preset_kind())
         ));
     }
     Ok(())
@@ -677,7 +828,7 @@ async fn record_test_usage(state: &AppState, attempt: TestUsageAttempt<'_>) -> A
     .bind(Uuid::new_v4().to_string())
     .bind(reservation_id)
     .bind(&provider.id)
-    .bind(&provider.provider_kind)
+    .bind(provider.preset_kind())
     .bind(&provider.model)
     .bind(test_api_family(api_family))
     .bind(operation)
@@ -750,6 +901,7 @@ async fn to_dto(
     record: ProviderProfileRecord,
     active: Option<&str>,
 ) -> AppResult<ProviderProfileDto> {
+    let preset_kind = record.preset_kind().to_owned();
     let capabilities = serde_json::from_str::<ProviderCapabilities>(&record.capabilities_json)
         .ok()
         .map(|value| capabilities_to_dto(&value));
@@ -768,7 +920,7 @@ async fn to_dto(
     Ok(ProviderProfileDto {
         id: record.id.clone(),
         name: record.name,
-        kind: record.provider_kind,
+        kind: preset_kind,
         base_url: record.base_url,
         model: record.model,
         transport: match record.api_family.as_str() {
@@ -837,7 +989,26 @@ fn default_capabilities(kind: &str, transport: &str) -> ProviderCapabilities {
         } else {
             ApiFamily::OpenAiResponses
         }),
+        "mistral" => ProviderCapabilities::mistral_openai_compatible(),
+        "google" => ProviderCapabilities::google_openai_compatible(),
+        "moonshot" => ProviderCapabilities::moonshot_openai_compatible(),
+        "kimi" => ProviderCapabilities::hosted_openai_compatible(),
         _ => ProviderCapabilities::custom_openai_compatible(),
+    }
+}
+
+fn database_provider_kind(preset: &str) -> &str {
+    match preset {
+        "mistral" | "kimi" | "moonshot" | "google" => "custom",
+        other => other,
+    }
+}
+
+fn compatible_output_token_field<'a>(preset: &str, configured: &'a str) -> &'a str {
+    match preset {
+        "mistral" | "google" => "max_tokens",
+        "kimi" | "moonshot" => "max_completion_tokens",
+        _ => configured,
     }
 }
 
@@ -846,7 +1017,10 @@ fn database_transport(kind: &str, transport: &str) -> AppResult<&'static str> {
         ("openai", "responses") => Ok("responses"),
         ("claude", "anthropic_messages" | "messages") => Ok("messages"),
         ("lmstudio" | "custom", "responses") => Ok("responses"),
-        ("lmstudio" | "custom", "chat_completions") => Ok("chat_completions"),
+        (
+            "lmstudio" | "custom" | "mistral" | "kimi" | "moonshot" | "google",
+            "chat_completions",
+        ) => Ok("chat_completions"),
         _ => Err(AppError::Validation(
             "the selected provider and API transport are incompatible".to_owned(),
         )),
@@ -861,17 +1035,11 @@ fn validate(input: &ProviderProfileDto) -> AppResult<()> {
     }
     if !matches!(
         input.kind.as_str(),
-        "openai" | "claude" | "lmstudio" | "custom"
+        "openai" | "claude" | "lmstudio" | "custom" | "mistral" | "kimi" | "moonshot" | "google"
     ) {
         return Err(AppError::Validation("unknown provider preset".to_owned()));
     }
-    let url = Url::parse(input.base_url.trim())
-        .map_err(|_| AppError::Validation("provider base URL must be absolute".to_owned()))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(AppError::Validation(
-            "provider base URL must use HTTP or HTTPS".to_owned(),
-        ));
-    }
+    validate_provider_base_url(input.base_url.trim())?;
     database_transport(&input.kind, &input.transport)?;
     if !matches!(
         input.chat_output_token_field.as_str(),
@@ -906,7 +1074,56 @@ fn validate(input: &ProviderProfileDto) -> AppResult<()> {
                 .to_owned(),
         ));
     }
+    if input.kind == "mistral" && input.reasoning_effort.as_deref() == Some("max") {
+        return Err(AppError::Validation(
+            "Mistral supports none, minimal, low, medium, high, or xhigh reasoning effort"
+                .to_owned(),
+        ));
+    }
+    if input.kind == "google" && matches!(input.reasoning_effort.as_deref(), Some("xhigh" | "max"))
+    {
+        return Err(AppError::Validation(
+            "Google Gemini supports none, minimal, low, medium, or high reasoning effort"
+                .to_owned(),
+        ));
+    }
+    if input.kind == "kimi" && input.reasoning_effort.is_some() {
+        return Err(AppError::Validation(
+            "the Kimi preset does not enable reasoning controls; leave reasoning effort blank"
+                .to_owned(),
+        ));
+    }
+    if input.kind == "moonshot"
+        && input
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|effort| !matches!(effort, "low" | "high" | "max"))
+    {
+        return Err(AppError::Validation(
+            "Moonshot supports low, high, or max reasoning effort; leave it blank to omit reasoning controls"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn provider_requires_api_key(kind: &str) -> bool {
+    matches!(
+        kind,
+        "openai" | "claude" | "mistral" | "kimi" | "moonshot" | "google"
+    )
+}
+
+fn provider_label(kind: &str) -> &'static str {
+    match kind {
+        "openai" => "OpenAI",
+        "claude" => "Claude",
+        "mistral" => "Mistral",
+        "kimi" => "Kimi",
+        "moonshot" => "Moonshot",
+        "google" => "Google Gemini",
+        _ => "this provider",
+    }
 }
 
 fn validate_headers(headers: &BTreeMap<String, String>) -> AppResult<()> {
@@ -927,6 +1144,55 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RuntimeOptions, app};
+
+    async fn test_state() -> (tempfile::TempDir, AppState) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = app::initialize(RuntimeOptions {
+            data_dir: directory.path().to_owned(),
+            bind: "127.0.0.1".parse().expect("loopback address"),
+            port: 0,
+            open_browser: false,
+        })
+        .await
+        .expect("application state");
+        (directory, state)
+    }
+
+    fn custom_profile(
+        base_url: &str,
+        api_key: Option<&str>,
+        headers: Option<BTreeMap<String, String>>,
+    ) -> ProviderProfileDto {
+        ProviderProfileDto {
+            id: String::new(),
+            name: "Custom provider".to_owned(),
+            kind: "custom".to_owned(),
+            base_url: base_url.to_owned(),
+            model: "entered-model".to_owned(),
+            transport: "chat_completions".to_owned(),
+            chat_output_token_field: "max_tokens".to_owned(),
+            api_key_configured: false,
+            api_key: api_key.map(str::to_owned),
+            headers,
+            headers_configured: false,
+            reasoning_effort: None,
+            temperature: None,
+            max_output_tokens: Some(1_000),
+            active: false,
+            capabilities: None,
+            last_tested_at: None,
+            last_test_ok: None,
+        }
+    }
+
+    async fn saved_record(state: &AppState, id: &str) -> ProviderProfileRecord {
+        sqlx::query_as("SELECT * FROM provider_profiles WHERE id=?")
+            .bind(id)
+            .fetch_one(state.database.pool())
+            .await
+            .expect("saved provider")
+    }
 
     #[test]
     fn presets_are_transport_strict() {
@@ -939,11 +1205,77 @@ mod tests {
             database_transport("claude", "anthropic_messages").unwrap(),
             "messages"
         );
+        for preset in ["mistral", "kimi", "moonshot", "google"] {
+            assert_eq!(
+                database_transport(preset, "chat_completions").unwrap(),
+                "chat_completions"
+            );
+            assert!(database_transport(preset, "responses").is_err());
+            assert_eq!(database_provider_kind(preset), "custom");
+        }
+        assert_eq!(
+            compatible_output_token_field("mistral", "max_completion_tokens"),
+            "max_tokens"
+        );
+        assert_eq!(
+            compatible_output_token_field("google", "max_completion_tokens"),
+            "max_tokens"
+        );
+        for preset in ["kimi", "moonshot"] {
+            assert_eq!(
+                compatible_output_token_field(preset, "max_tokens"),
+                "max_completion_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_base_urls_reject_embedded_or_unjoinable_components() {
+        for base_url in [
+            "https://user@provider.example/v1",
+            "https://user:password@provider.example/v1",
+            "https://provider.example/v1?tenant=secret",
+            "https://provider.example/v1#fragment",
+        ] {
+            let input = custom_profile(base_url, None, None);
+            assert!(validate(&input).is_err(), "accepted unsafe URL: {base_url}");
+        }
     }
 
     #[test]
     fn openai_temperature_is_off_until_capability_test_enables_it() {
         assert!(!default_capabilities("openai", "responses").temperature);
+        for preset in ["mistral", "kimi", "moonshot", "google"] {
+            assert!(!default_capabilities(preset, "chat_completions").temperature);
+        }
+        assert!(
+            default_capabilities("mistral", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::XHigh)
+        );
+        assert!(
+            !default_capabilities("mistral", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::Max)
+        );
+        assert!(
+            default_capabilities("google", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::High)
+        );
+        assert!(
+            !default_capabilities("google", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::XHigh)
+        );
+        assert!(
+            default_capabilities("moonshot", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::Low)
+        );
+        assert!(
+            default_capabilities("moonshot", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::Max)
+        );
+        assert!(
+            !default_capabilities("moonshot", "chat_completions")
+                .supports_reasoning_effort(ReasoningEffort::Medium)
+        );
     }
 
     #[test]
@@ -959,5 +1291,363 @@ mod tests {
         assert!(validate(&input).is_err());
         input.reasoning_effort = Some("none".to_owned());
         assert!(validate(&input).is_ok());
+    }
+
+    #[test]
+    fn hosted_preset_dtos_round_trip_and_reject_unsupported_reasoning() {
+        let cases = [
+            ("mistral", "https://api.mistral.ai/v1"),
+            ("kimi", "https://api.moonshot.ai/v1"),
+            ("moonshot", "https://api.moonshot.cn/v1"),
+            (
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            ),
+        ];
+        for (kind, base_url) in cases {
+            let input: ProviderProfileDto = serde_json::from_value(serde_json::json!({
+                "name": kind,
+                "kind": kind,
+                "base_url": base_url,
+                "transport": "chat_completions",
+                "temperature": null
+            }))
+            .expect("preset DTO");
+            validate(&input).expect("valid preset");
+            let serialized = serde_json::to_value(&input).expect("serialize DTO");
+            assert_eq!(serialized["kind"], kind);
+            assert_eq!(serialized["base_url"], base_url);
+            assert_eq!(serialized["transport"], "chat_completions");
+            assert!(serialized["temperature"].is_null());
+        }
+
+        for (kind, effort) in [
+            ("mistral", "max"),
+            ("google", "xhigh"),
+            ("kimi", "low"),
+            ("kimi", "none"),
+            ("moonshot", "none"),
+            ("moonshot", "medium"),
+        ] {
+            let input: ProviderProfileDto = serde_json::from_value(serde_json::json!({
+                "name": kind,
+                "kind": kind,
+                "base_url": "https://provider.example/v1",
+                "transport": "chat_completions",
+                "reasoning_effort": effort
+            }))
+            .expect("preset DTO");
+            assert!(validate(&input).is_err(), "{kind} accepted {effort}");
+        }
+
+        for effort in ["low", "high", "max"] {
+            let input: ProviderProfileDto = serde_json::from_value(serde_json::json!({
+                "name": "Moonshot",
+                "kind": "moonshot",
+                "base_url": "https://api.moonshot.cn/v1",
+                "transport": "chat_completions",
+                "reasoning_effort": effort
+            }))
+            .expect("preset DTO");
+            validate(&input).unwrap_or_else(|_| panic!("Moonshot rejected {effort}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_required_destination_rejects_blank_key_without_touching_old_secrets() {
+        let (_directory, state) = test_state().await;
+        let headers = BTreeMap::from([(
+            "x-private-provider-header".to_owned(),
+            "old-header-secret".to_owned(),
+        )]);
+        let saved = create(
+            &state,
+            custom_profile(
+                "https://old-provider.example/v1",
+                Some("old-api-key"),
+                Some(headers),
+            ),
+        )
+        .await
+        .expect("initial provider");
+        let before = saved_record(&state, &saved.id).await;
+        let old_api_key = before.api_key_secret_key.clone().expect("API key pointer");
+        let old_headers = before.headers_secret_key.clone().expect("headers pointer");
+
+        let mut changed = saved.clone();
+        changed.kind = "openai".to_owned();
+        changed.name = "OpenAI".to_owned();
+        changed.base_url = "https://api.openai.com/v1".to_owned();
+        changed.transport = "responses".to_owned();
+        changed.api_key = None;
+        changed.headers = None;
+        let error = update(&state, &saved.id, changed.clone())
+            .await
+            .expect_err("changed destination must require a freshly entered key");
+        assert!(matches!(
+            error,
+            AppError::Validation(message) if message.contains("requires entering a new OpenAI API key")
+        ));
+
+        let after_rejection = saved_record(&state, &saved.id).await;
+        assert_eq!(after_rejection.preset_kind(), "custom");
+        assert_eq!(after_rejection.base_url, before.base_url);
+        assert_eq!(
+            after_rejection.api_key_secret_key.as_deref(),
+            Some(old_api_key.as_str())
+        );
+        assert_eq!(
+            after_rejection.headers_secret_key.as_deref(),
+            Some(old_headers.as_str())
+        );
+        assert_eq!(
+            state
+                .secrets
+                .get(&old_api_key)
+                .await
+                .expect("old API key lookup")
+                .expect("old API key")
+                .as_str(),
+            "old-api-key"
+        );
+        assert_eq!(
+            state
+                .secrets
+                .get(&old_headers)
+                .await
+                .expect("old headers lookup")
+                .expect("old headers")
+                .as_str(),
+            "{\"x-private-provider-header\":\"old-header-secret\"}"
+        );
+
+        changed.api_key = Some("new-openai-key".to_owned());
+        let updated = update(&state, &saved.id, changed)
+            .await
+            .expect("changed destination with new key");
+        assert!(updated.api_key_configured);
+        assert!(!updated.headers_configured);
+        let replacement = saved_record(&state, &saved.id).await;
+        let replacement_key = replacement
+            .api_key_secret_key
+            .as_deref()
+            .expect("replacement API key pointer");
+        assert_ne!(replacement_key, old_api_key);
+        assert_eq!(
+            state
+                .secrets
+                .get(replacement_key)
+                .await
+                .expect("replacement API key lookup")
+                .expect("replacement API key")
+                .as_str(),
+            "new-openai-key"
+        );
+        assert!(!state.secrets.exists(&old_api_key).await.expect("old key"));
+        assert!(
+            !state
+                .secrets
+                .exists(&old_headers)
+                .await
+                .expect("old headers")
+        );
+        delete(&state, &saved.id).await.expect("provider cleanup");
+    }
+
+    #[tokio::test]
+    async fn changed_optional_destination_drops_credentials_only_after_update() {
+        let (_directory, state) = test_state().await;
+        let headers = BTreeMap::from([("authorization-extra".to_owned(), "secret".to_owned())]);
+        let saved = create(
+            &state,
+            custom_profile(
+                "https://first.example/v1",
+                Some("old-optional-key"),
+                Some(headers),
+            ),
+        )
+        .await
+        .expect("initial provider");
+        let before = saved_record(&state, &saved.id).await;
+        let old_api_key = before.api_key_secret_key.clone().expect("API key pointer");
+        let old_headers = before.headers_secret_key.clone().expect("headers pointer");
+
+        let mut changed = saved.clone();
+        changed.base_url = "https://second.example/v1".to_owned();
+        changed.api_key = None;
+        changed.headers = None;
+        let updated = update(&state, &saved.id, changed)
+            .await
+            .expect("keyless custom destination update");
+        assert!(!updated.api_key_configured);
+        assert!(!updated.headers_configured);
+        let after = saved_record(&state, &saved.id).await;
+        assert_eq!(after.base_url, "https://second.example/v1");
+        assert!(after.api_key_secret_key.is_none());
+        assert!(after.headers_secret_key.is_none());
+        assert!(!state.secrets.exists(&old_api_key).await.expect("old key"));
+        assert!(
+            !state
+                .secrets
+                .exists(&old_headers)
+                .await
+                .expect("old headers")
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_remote_http_update_is_rejected_without_touching_old_secrets() {
+        let (_directory, state) = test_state().await;
+        let headers = BTreeMap::from([("x-private".to_owned(), "old-header".to_owned())]);
+        let saved = create(
+            &state,
+            custom_profile("https://secure.example/v1", Some("old-key"), Some(headers)),
+        )
+        .await
+        .expect("initial provider");
+        let before = saved_record(&state, &saved.id).await;
+        let old_api_key = before.api_key_secret_key.clone().expect("API key pointer");
+        let old_headers = before.headers_secret_key.clone().expect("headers pointer");
+
+        let mut insecure = saved.clone();
+        insecure.base_url = "http://provider.example/v1".to_owned();
+        insecure.api_key = Some("replacement-key".to_owned());
+        insecure.headers = Some(BTreeMap::from([(
+            "x-private".to_owned(),
+            "replacement-header".to_owned(),
+        )]));
+        let error = update(&state, &saved.id, insecure)
+            .await
+            .expect_err("remote HTTP must not carry provider secrets");
+        assert!(matches!(
+            error,
+            AppError::Validation(message) if message.contains("require HTTPS")
+        ));
+
+        let after = saved_record(&state, &saved.id).await;
+        assert_eq!(after.base_url, before.base_url);
+        assert_eq!(after.api_key_secret_key, before.api_key_secret_key);
+        assert_eq!(after.headers_secret_key, before.headers_secret_key);
+        assert_eq!(
+            state
+                .secrets
+                .get(&old_api_key)
+                .await
+                .expect("old API key lookup")
+                .expect("old API key")
+                .as_str(),
+            "old-key"
+        );
+        assert_eq!(
+            state
+                .secrets
+                .get(&old_headers)
+                .await
+                .expect("old headers lookup")
+                .expect("old headers")
+                .as_str(),
+            "{\"x-private\":\"old-header\"}"
+        );
+        delete(&state, &saved.id).await.expect("provider cleanup");
+    }
+
+    #[tokio::test]
+    async fn failed_database_update_keeps_the_working_profile_and_secrets() {
+        let (_directory, state) = test_state().await;
+        let headers = BTreeMap::from([("x-private".to_owned(), "old-header".to_owned())]);
+        let saved = create(
+            &state,
+            custom_profile(
+                "https://working.example/v1",
+                Some("working-key"),
+                Some(headers),
+            ),
+        )
+        .await
+        .expect("initial provider");
+        let before = saved_record(&state, &saved.id).await;
+        let old_api_key = before.api_key_secret_key.clone().expect("API key pointer");
+        let old_headers = before.headers_secret_key.clone().expect("headers pointer");
+        sqlx::query(
+            "CREATE TRIGGER reject_provider_update BEFORE UPDATE ON provider_profiles \
+             BEGIN SELECT RAISE(ABORT, 'deliberate provider update failure'); END",
+        )
+        .execute(state.database.pool())
+        .await
+        .expect("failure trigger");
+
+        let mut changed = saved.clone();
+        changed.base_url = "https://replacement.example/v1".to_owned();
+        changed.api_key = Some("replacement-key".to_owned());
+        changed.headers = Some(BTreeMap::from([(
+            "x-private".to_owned(),
+            "replacement-header".to_owned(),
+        )]));
+        let error = update(&state, &saved.id, changed)
+            .await
+            .expect_err("database trigger must reject update");
+        assert!(matches!(error, AppError::Database(_)));
+
+        let after = saved_record(&state, &saved.id).await;
+        assert_eq!(after.base_url, before.base_url);
+        assert_eq!(after.api_key_secret_key, before.api_key_secret_key);
+        assert_eq!(after.headers_secret_key, before.headers_secret_key);
+        assert_eq!(
+            state
+                .secrets
+                .get(&old_api_key)
+                .await
+                .expect("old API key lookup")
+                .expect("old API key")
+                .as_str(),
+            "working-key"
+        );
+        assert_eq!(
+            state
+                .secrets
+                .get(&old_headers)
+                .await
+                .expect("old headers lookup")
+                .expect("old headers")
+                .as_str(),
+            "{\"x-private\":\"old-header\"}"
+        );
+
+        sqlx::query("DROP TRIGGER reject_provider_update")
+            .execute(state.database.pool())
+            .await
+            .expect("remove failure trigger");
+        delete(&state, &saved.id).await.expect("provider cleanup");
+    }
+
+    #[tokio::test]
+    async fn blank_credentials_are_retained_for_same_normalized_destination() {
+        let (_directory, state) = test_state().await;
+        let headers = BTreeMap::from([("x-private".to_owned(), "header-value".to_owned())]);
+        let saved = create(
+            &state,
+            custom_profile(
+                "https://provider.example/v1",
+                Some("retained-key"),
+                Some(headers),
+            ),
+        )
+        .await
+        .expect("initial provider");
+        let before = saved_record(&state, &saved.id).await;
+
+        let mut unchanged = saved.clone();
+        unchanged.base_url = "HTTPS://PROVIDER.EXAMPLE:443/v1/".to_owned();
+        unchanged.api_key = None;
+        unchanged.headers = None;
+        let updated = update(&state, &saved.id, unchanged)
+            .await
+            .expect("same normalized destination update");
+        assert!(updated.api_key_configured);
+        assert!(updated.headers_configured);
+        let after = saved_record(&state, &saved.id).await;
+        assert_eq!(after.api_key_secret_key, before.api_key_secret_key);
+        assert_eq!(after.headers_secret_key, before.headers_secret_key);
+        delete(&state, &saved.id).await.expect("provider cleanup");
     }
 }

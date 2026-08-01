@@ -23,6 +23,10 @@ pub enum ProviderKind {
     OpenAi,
     Anthropic,
     LmStudio,
+    Mistral,
+    Kimi,
+    Moonshot,
+    Google,
     #[serde(
         rename = "custom_openai_compatible",
         alias = "custom_open_ai_compatible"
@@ -164,6 +168,64 @@ impl ProviderCapabilities {
             pdf_input: false,
             native_token_count: false,
             reasoning_efforts: None,
+        }
+    }
+
+    pub fn hosted_openai_compatible() -> Self {
+        Self {
+            // Hosted presets may reject sampling parameters for reasoning
+            // models. Start with every optional capability disabled and let
+            // the setup-time probe enable only what the endpoint proves.
+            temperature: false,
+            reasoning_effort: false,
+            adaptive_thinking: false,
+            thinking_budget: false,
+            strict_json_schema: false,
+            image_input: false,
+            pdf_input: false,
+            native_token_count: false,
+            reasoning_efforts: None,
+        }
+    }
+
+    pub fn google_openai_compatible() -> Self {
+        Self {
+            reasoning_effort: true,
+            reasoning_efforts: Some(vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]),
+            ..Self::hosted_openai_compatible()
+        }
+    }
+
+    pub fn mistral_openai_compatible() -> Self {
+        Self {
+            reasoning_effort: true,
+            reasoning_efforts: Some(vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]),
+            ..Self::hosted_openai_compatible()
+        }
+    }
+
+    pub fn moonshot_openai_compatible() -> Self {
+        Self {
+            reasoning_effort: true,
+            reasoning_efforts: Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            ..Self::hosted_openai_compatible()
         }
     }
 

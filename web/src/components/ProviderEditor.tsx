@@ -1,12 +1,36 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import { providerPresets } from "../api/defaults";
+import { providerPresetOptions, providerPresets } from "../api/defaults";
 import type { ProviderKind, ProviderProfile, ProviderTestResult, ProviderTransport } from "../api/types";
 import { useToast } from "./Toast";
 import { Alert, Badge, Button, Field, Input, Select, Toggle } from "./UI";
 
+const HOSTED_API_KEY_KINDS = new Set<ProviderKind>(["openai", "claude", "mistral", "kimi", "moonshot", "google"]);
+const FIXED_CHAT_COMPLETIONS_KINDS = new Set<ProviderKind>(["mistral", "kimi", "moonshot", "google"]);
+type ReasoningEffort = NonNullable<ProviderProfile["reasoning_effort"]>;
+const REASONING_LABELS: Record<ReasoningEffort, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Maximum",
+};
+
 export function newProvider(kind: ProviderKind): ProviderProfile {
   return { ...providerPresets[kind], id: "" };
+}
+
+export function credentialDestination(provider: ProviderProfile): string {
+  const trimmed = provider.base_url.trim().replace(/\/+$/, "");
+  let normalized = trimmed;
+  try {
+    normalized = new URL(trimmed).toString().replace(/\/+$/, "");
+  } catch {
+    // Keep incomplete form input comparable while the user is still typing.
+  }
+  return `${provider.kind}\n${normalized}`;
 }
 
 export function ProviderEditor({ provider, onChange, onSaved, showActive = true }: {
@@ -21,6 +45,9 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
   const [models, setModels] = useState<string[]>([]);
   const [result, setResult] = useState<ProviderTestResult>();
   const [error, setError] = useState<string>();
+  const [savedSecretDestination, setSavedSecretDestination] = useState<string | undefined>(() =>
+    provider.api_key_configured || provider.headers_configured ? credentialDestination(provider) : undefined,
+  );
   const { showToast } = useToast();
   const update = <K extends keyof ProviderProfile>(key: K, value: ProviderProfile[K]) => {
     const invalidatesTest = ["base_url", "api_key", "model", "transport", "reasoning_effort", "temperature", "headers", "max_output_tokens"].includes(key);
@@ -36,9 +63,29 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
     setModels([]);
     setResult(undefined);
     setError(undefined);
+    setSavedSecretDestination(
+      provider.api_key_configured || provider.headers_configured ? credentialDestination(provider) : undefined,
+    );
   }, [provider.id]);
 
-  const supportsReasoning = provider.kind === "openai" || provider.kind === "claude" || provider.capabilities?.reasoning;
+  const requiresApiKey = HOSTED_API_KEY_KINDS.has(provider.kind);
+  const secretDestinationChanged = savedSecretDestination !== undefined
+    && savedSecretDestination !== credentialDestination(provider);
+  const apiKeyConfiguredForDestination = provider.api_key_configured && !secretDestinationChanged;
+  const missingRequiredApiKey = requiresApiKey && !apiKeyConfiguredForDestination && !provider.api_key?.trim();
+  const fixedChatCompletions = FIXED_CHAT_COMPLETIONS_KINDS.has(provider.kind);
+  const reasoningEfforts: ReasoningEffort[] = provider.kind === "claude"
+    ? ["low", "medium", "high", "xhigh", "max"]
+    : provider.kind === "mistral"
+      ? ["none", "minimal", "low", "medium", "high", "xhigh"]
+      : provider.kind === "moonshot"
+        ? ["low", "high", "max"]
+      : provider.kind === "google"
+        ? ["none", "minimal", "low", "medium", "high"]
+        : provider.kind === "openai" || provider.capabilities?.reasoning
+          ? ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+          : [];
+  const supportsReasoning = reasoningEfforts.length > 0;
   const supportsTemperature = provider.kind === "custom" || provider.kind === "lmstudio" || provider.capabilities?.temperature;
 
   async function save(): Promise<ProviderProfile | undefined> {
@@ -49,6 +96,9 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
       const saved = provider.id
         ? await api.updateProvider(provider)
         : await api.createProvider(newProfile);
+      setSavedSecretDestination(
+        saved.api_key_configured || saved.headers_configured ? credentialDestination(saved) : undefined,
+      );
       onSaved(saved);
       showToast(`${saved.name} saved`);
       return saved;
@@ -62,6 +112,9 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
   async function ensureSaved(): Promise<ProviderProfile | undefined> {
     if (provider.id) {
       const saved = await api.updateProvider(provider);
+      setSavedSecretDestination(
+        saved.api_key_configured || saved.headers_configured ? credentialDestination(saved) : undefined,
+      );
       onSaved(saved);
       return saved;
     }
@@ -125,36 +178,41 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
         <Field label="Provider preset" required>
           <Select value={provider.kind} onChange={(event) => {
             const kind = event.target.value as ProviderKind;
+            setModels([]);
+            setResult(undefined);
+            setError(undefined);
+            setSavedSecretDestination(undefined);
             onChange({ ...newProvider(kind), id: provider.id, active: provider.active, name: providerPresets[kind].name });
           }}>
-            <option value="openai">OpenAI</option><option value="claude">Claude</option><option value="lmstudio">LM Studio</option><option value="custom">Custom OpenAI-compatible</option>
+            {providerPresetOptions.map((preset) => <option key={preset.kind} value={preset.kind}>{preset.label}</option>)}
           </Select>
         </Field>
       </div>
       <Field label="Base URL" required hint={provider.kind === "lmstudio" ? "LM Studio typically runs locally on port 1234." : "Requests are sent directly from this PaperlessLLM service."}>
         <Input type="url" value={provider.base_url} onChange={(event) => update("base_url", event.target.value)} placeholder="https://…" />
       </Field>
-      <Field label="API key" hint={provider.api_key_configured ? "A key is saved. Leave blank to keep it." : provider.kind === "lmstudio" ? "Usually not required for LM Studio." : "Stored securely; never returned to this browser."}>
-        <Input type="password" value={provider.api_key ?? ""} onChange={(event) => update("api_key", event.target.value)} autoComplete="new-password" placeholder={provider.api_key_configured ? "••••••••••••" : "Enter API key"} />
+      <Field label="API key" required={requiresApiKey} hint={secretDestinationChanged ? (requiresApiKey ? "The provider destination changed. Re-enter its API key; the saved key will not be reused." : "The provider destination changed. Enter a new key or leave this blank to clear the saved key.") : apiKeyConfiguredForDestination ? "A key is saved for this destination. Leave blank to keep it." : provider.kind === "kimi" ? "Use a key from the Kimi Global platform; China-platform keys are separate." : provider.kind === "moonshot" ? "Use a key from the Moonshot China platform; global-platform keys are separate." : requiresApiKey ? "Required for this hosted provider. Stored securely and never returned to this browser." : provider.kind === "lmstudio" ? "Usually not required for LM Studio." : "Optional Bearer key. Stored securely and never returned to this browser."}>
+        <Input type="password" required={requiresApiKey} value={provider.api_key ?? ""} onChange={(event) => update("api_key", event.target.value)} autoComplete="new-password" placeholder={apiKeyConfiguredForDestination ? "••••••••••••" : requiresApiKey ? "Enter required API key" : "Optional API key"} />
       </Field>
       <div className="form-grid form-grid--model">
         <Field label="Model ID" required>
           <Input list={`models-${provider.id || "new"}`} value={provider.model} onChange={(event) => update("model", event.target.value)} placeholder="Choose or enter a model ID" />
           <datalist id={`models-${provider.id || "new"}`}>{models.map((model) => <option key={model} value={model} />)}</datalist>
         </Field>
-        <Button type="button" variant="secondary" loading={loadingModels} onClick={() => void loadModels()}>Discover models</Button>
+        <Button type="button" variant="secondary" loading={loadingModels} onClick={() => void loadModels()} disabled={!provider.base_url || missingRequiredApiKey}>Discover models</Button>
       </div>
-      {(provider.kind === "lmstudio" || provider.kind === "custom") && (
+      {(provider.kind === "lmstudio" || provider.kind === "custom" || fixedChatCompletions) && (
         <div className="form-grid form-grid--two"><Field label="API transport">
-          <Select value={provider.transport} onChange={(event) => update("transport", event.target.value as ProviderTransport)}>
-            <option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option>
+          <Select value={provider.transport} disabled={fixedChatCompletions} onChange={(event) => update("transport", event.target.value as ProviderTransport)}>
+            {!fixedChatCompletions && <option value="responses">Responses API</option>}<option value="chat_completions">Chat Completions</option>
           </Select>
-        </Field>{provider.transport === "chat_completions" && <Field label="Generated-token field" hint="Choose the field expected by this compatible server."><Select value={provider.chat_output_token_field ?? "max_tokens"} onChange={(event) => update("chat_output_token_field", event.target.value as ProviderProfile["chat_output_token_field"])}><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></Select></Field>}</div>
+        </Field>{provider.transport === "chat_completions" && <Field label="Generated-token field" hint={fixedChatCompletions ? "Fixed to the field required by this provider preset." : "Choose the field expected by this compatible server."}><Select value={provider.chat_output_token_field ?? "max_tokens"} disabled={fixedChatCompletions} onChange={(event) => update("chat_output_token_field", event.target.value as ProviderProfile["chat_output_token_field"])}><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></Select></Field>}</div>
       )}
       {supportsReasoning && (
         <Field label={provider.kind === "claude" ? "Thinking effort" : "Reasoning effort"} hint="Sent only when the model and provider support it.">
           <Select value={provider.reasoning_effort ?? ""} onChange={(event) => update("reasoning_effort", (event.target.value || undefined) as ProviderProfile["reasoning_effort"])}>
-            <option value="">Provider default (omit field)</option><option value="none">None</option>{provider.kind !== "claude" && <option value="minimal">Minimal</option>}<option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Maximum</option>
+            <option value="">Provider default (omit field)</option>
+            {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{REASONING_LABELS[effort]}</option>)}
           </Select>
         </Field>
       )}
@@ -165,7 +223,7 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
       {provider.kind === "custom" && (
         <div>
           <div className="inline-heading"><strong>Custom request headers</strong><span>Optional</span></div>
-          {provider.headers_configured && provider.headers === undefined && <Alert tone="info"><p>Custom headers are stored securely. Their values are hidden; choose replace to enter a complete new set or clear to remove them.</p><div className="form-actions"><Button type="button" variant="ghost" size="sm" onClick={() => update("headers", {})}>Replace stored headers</Button><Button type="button" variant="danger" size="sm" onClick={() => update("headers", {})}>Clear stored headers</Button></div></Alert>}
+          {provider.headers_configured && provider.headers === undefined && <Alert tone={secretDestinationChanged ? "warning" : "info"}><p>{secretDestinationChanged ? "The destination changed, so saved headers will not be sent there. Replace them with a complete new set, or save as-is to clear them." : "Custom headers are stored securely. Their values are hidden; choose replace to enter a complete new set or clear to remove them."}</p><div className="form-actions"><Button type="button" variant="ghost" size="sm" onClick={() => update("headers", {})}>Replace stored headers</Button><Button type="button" variant="danger" size="sm" onClick={() => update("headers", {})}>Clear stored headers</Button></div></Alert>}
           {provider.headers !== undefined && <div className="header-editor">
             {headerRows.map(([key, value], index) => (
               <div className="header-row" key={`${key}-${index}`}>
@@ -191,8 +249,8 @@ export function ProviderEditor({ provider, onChange, onSaved, showActive = true 
       {showActive && <Toggle checked={provider.active} onChange={(next) => update("active", next)} label="Use this provider for processing" description="Only one provider profile can be active at a time." />}
       <p className="muted">Provider Test performs one or two small inference calls. Each call is budgeted separately, and its token usage is recorded in Statistics.</p>
       <div className="form-actions">
-        <Button type="button" variant="secondary" loading={testing} onClick={() => void test()} disabled={!provider.base_url || !provider.model}>Test provider</Button>
-        <Button type="button" loading={saving} onClick={() => void save()} disabled={!provider.name || !provider.base_url}>Save provider</Button>
+        <Button type="button" variant="secondary" loading={testing} onClick={() => void test()} disabled={!provider.base_url || !provider.model || missingRequiredApiKey}>Test provider</Button>
+        <Button type="button" loading={saving} onClick={() => void save()} disabled={!provider.name || !provider.base_url || missingRequiredApiKey}>Save provider</Button>
       </div>
     </div>
   );

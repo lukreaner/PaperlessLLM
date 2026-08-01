@@ -956,9 +956,10 @@ mod tests {
             }];
             let merged = merge_custom_fields(&existing_values, &updates, &HashMap::new());
             for (field, value) in existing {
+                let expected = json!(value);
                 prop_assert_eq!(
                     merged.iter().find(|candidate| candidate.field == field).map(|candidate| &candidate.value),
-                    Some(&json!(value)),
+                    Some(&expected),
                 );
             }
         }

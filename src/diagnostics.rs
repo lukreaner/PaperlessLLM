@@ -222,7 +222,7 @@ impl RotatingLogState {
 
 fn validate_data_directory(data_dir: &Path) -> AppResult<()> {
     let metadata = std::fs::symlink_metadata(data_dir).map_err(AppError::from)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
         return Err(AppError::Validation(
             "desktop log data directory must be a real directory".to_owned(),
         ));
@@ -232,7 +232,7 @@ fn validate_data_directory(data_dir: &Path) -> AppResult<()> {
 
 fn validate_optional_regular_file(path: &Path) -> AppResult<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => Err(
             AppError::Validation("desktop log targets must be regular files".to_owned()),
         ),
         Ok(_) => Ok(()),
@@ -260,7 +260,7 @@ fn recover_interrupted_rotation(paths: &DesktopLogPaths) -> AppResult<bool> {
 
 fn regular_file_exists(path: &Path) -> AppResult<bool> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(metadata) if metadata.is_file() && !metadata_is_link_or_reparse(&metadata) => Ok(true),
         Ok(_) => Err(AppError::Validation(
             "desktop log targets must be regular files".to_owned(),
         )),
@@ -315,17 +315,12 @@ fn open_private_file(path: &Path, append: bool, create: bool) -> AppResult<File>
 }
 
 fn open_private_file_io(path: &Path, append: bool, create: bool) -> std::io::Result<File> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
     let mut options = OpenOptions::new();
     options.read(true).write(true).append(append).create(create);
-    #[cfg(unix)]
-    options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    crate::private_fs::configure_private_open(&mut options, 0o600);
     let file = options.open(path)?;
-    set_private_file_permissions(&file)?;
+    crate::private_fs::harden_private_file(path)?;
+    verify_open_file_matches_path(&file, path)?;
     Ok(file)
 }
 
@@ -334,17 +329,12 @@ fn create_private_file(path: &Path) -> AppResult<File> {
 }
 
 fn create_private_file_io(path: &Path) -> std::io::Result<File> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
     let mut options = OpenOptions::new();
     options.read(true).write(true).append(true).create_new(true);
-    #[cfg(unix)]
-    options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    crate::private_fs::configure_private_open(&mut options, 0o600);
     let file = options.open(path)?;
-    set_private_file_permissions(&file)?;
+    crate::private_fs::harden_private_file(path)?;
+    verify_open_file_matches_path(&file, path)?;
     Ok(file)
 }
 
@@ -358,18 +348,9 @@ fn write_log_header_io(file: &File) -> std::io::Result<()> {
     file.flush()
 }
 
-fn set_private_file_permissions(file: &File) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 fn remove_regular_file_if_present(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+        Ok(metadata) if metadata.is_file() && !metadata_is_link_or_reparse(&metadata) => {
             std::fs::remove_file(path)
         }
         Ok(_) => Err(std::io::Error::new(
@@ -383,16 +364,16 @@ fn remove_regular_file_if_present(path: &Path) -> std::io::Result<()> {
 
 fn verify_open_file_matches_path(file: &File, path: &Path) -> std::io::Result<()> {
     let path_metadata = std::fs::symlink_metadata(path)?;
-    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+    if metadata_is_link_or_reparse(&path_metadata) || !path_metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "desktop log path changed during rotation",
         ));
     }
-    let file_metadata = file.metadata()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let file_metadata = file.metadata()?;
         if file_metadata.dev() != path_metadata.dev() || file_metadata.ino() != path_metadata.ino()
         {
             return Err(std::io::Error::new(
@@ -401,7 +382,61 @@ fn verify_open_file_matches_path(file: &File, path: &Path) -> std::io::Result<()
             ));
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        crate::private_fs::configure_private_open(&mut options, 0o600);
+        let path_file = options.open(path)?;
+        if windows_file_identity(file)? != windows_file_identity(&path_file)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "desktop log path changed during rotation",
+            ));
+        }
+    }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_identity(file: &File) -> std::io::Result<(u32, u64)> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the OS writes the complete POD structure on success and the raw
+    // handle remains owned by `file` for the duration of the call.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr()) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "desktop log paths must not be reparse points",
+        ));
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
 }
 
 static ANSI_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
@@ -584,14 +619,12 @@ fn read_log_tail(path: PathBuf) -> Result<DiagnosticLogResponse, LogReadError> {
 }
 
 fn open_read_only_no_follow(path: &Path) -> std::io::Result<File> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options.open(path)
+    crate::private_fs::configure_private_open(&mut options, 0o600);
+    let file = options.open(path)?;
+    verify_open_file_matches_path(&file, path)?;
+    Ok(file)
 }
 
 /// Produce a single-line, low-detail description suitable for operational
@@ -956,7 +989,8 @@ fn safe_status(value: &str) -> Option<&str> {
 
 fn safe_provider(value: &str) -> Option<&str> {
     match value {
-        "openai" | "claude" | "lmstudio" | "custom" | "unknown" => Some(value),
+        "openai" | "claude" | "lmstudio" | "custom" | "mistral" | "kimi" | "moonshot"
+        | "google" | "unknown" => Some(value),
         _ => None,
     }
 }
@@ -1565,5 +1599,22 @@ mod tests {
         assert!(!serialized.contains("model"));
         assert!(!serialized.contains("title"));
         assert!(!serialized.contains("prompt"));
+    }
+
+    #[test]
+    fn hosted_provider_presets_are_safe_log_dimensions() {
+        for provider in ["mistral", "kimi", "moonshot", "google"] {
+            let entry = sanitize_log_entry(&format!(
+                "2026-08-01T10:00:00Z INFO provider request completed \
+                 event=\"provider.request_completed\" target=\"provider\" \
+                 provider={provider} operation=analysis status=succeeded"
+            ))
+            .unwrap();
+            assert_eq!(
+                entry.fields.get("provider").map(String::as_str),
+                Some(provider)
+            );
+        }
+        assert_eq!(safe_provider("attacker-controlled"), None);
     }
 }

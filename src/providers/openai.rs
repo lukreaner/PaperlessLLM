@@ -289,6 +289,8 @@ pub(crate) fn parse_openai_usage(usage: Option<&Value>) -> TokenUsage {
     let cache_read_tokens = usage
         .pointer("/input_tokens_details/cached_tokens")
         .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        // Kimi/Moonshot report cache hits directly on the usage object.
+        .or_else(|| usage.get("cached_tokens"))
         .and_then(Value::as_u64);
     let cache_write_tokens = usage
         .pointer("/input_tokens_details/cache_write_tokens")
@@ -475,6 +477,21 @@ mod tests {
         assert_eq!(normalized.output_tokens, Some(30));
         assert_eq!(normalized.reasoning_tokens, Some(20));
         assert_eq!(normalized.total_tokens, Some(130));
+    }
+
+    #[test]
+    fn normalizes_kimi_top_level_cached_tokens() {
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 25,
+            "total_tokens": 125,
+            "cached_tokens": 60
+        });
+        let normalized = parse_openai_usage(Some(&usage));
+        assert_eq!(normalized.input_tokens, Some(100));
+        assert_eq!(normalized.cache_read_tokens, Some(60));
+        assert_eq!(normalized.output_tokens, Some(25));
+        assert_eq!(normalized.total_tokens, Some(125));
     }
 
     #[test]

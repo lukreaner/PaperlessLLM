@@ -118,10 +118,84 @@ test("first-run wizard tests both connections and reaches the dashboard", async 
   await page.getByLabel("Model ID").fill("local-model");
   await page.getByRole("button", { name: "Test provider" }).click();
   await expect(page.getByText("Connection works")).toBeVisible();
+  const providerPreset = page.getByRole("combobox", { name: /^Provider preset/ });
+  await providerPreset.selectOption("google");
+  await expect(page.getByText("Connection works")).toHaveCount(0);
+  await providerPreset.selectOption("lmstudio");
+  await page.getByLabel("Model ID").fill("local-model");
+  await page.getByRole("button", { name: "Test provider" }).click();
+  await expect(page.getByText("Connection works")).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("button", { name: "Finish setup" }).click();
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+});
+
+test("hosted provider presets populate safe editable settings", async ({ page }) => {
+  await page.route("http://127.0.0.1:4173/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/bootstrap") return json(route, configuredBootstrap());
+    if (path === "/api/status") return json(route, status());
+    return json(route, { message: `Unhandled mock endpoint ${route.request().method()} ${path}` }, 500);
+  });
+
+  await page.goto("/settings?section=providers");
+  await page.getByRole("button", { name: "+ Add provider" }).click();
+  await page.locator(".add-menu__popover").getByRole("button", { name: /Mistral/ }).click();
+
+  const preset = page.getByRole("combobox", { name: /^Provider preset/ });
+  const baseUrl = page.getByRole("textbox", { name: /^Base URL/ });
+  const apiKey = page.getByRole("textbox", { name: /^API key/ });
+  const model = page.getByRole("combobox", { name: /^Model ID/ });
+  const transport = page.getByRole("combobox", { name: /^API transport/ });
+  const outputField = page.getByRole("combobox", { name: /^Generated-token field/ });
+
+  await expect(preset).toHaveValue("mistral");
+  await expect(baseUrl).toHaveValue("https://api.mistral.ai/v1");
+  await expect(model).toHaveValue("");
+  await expect(transport).toHaveValue("chat_completions");
+  await expect(transport).toBeDisabled();
+  await expect(outputField).toHaveValue("max_tokens");
+  await expect(outputField).toBeDisabled();
+  await expect(apiKey).toHaveAttribute("required", "");
+  await expect(page.getByRole("button", { name: "Save provider" })).toBeDisabled();
+  await expect(page.getByRole("combobox", { name: /^Reasoning effort/ }).locator("option")).toHaveText([
+    "Provider default (omit field)", "None", "Minimal", "Low", "Medium", "High", "Extra high",
+  ]);
+
+  await baseUrl.fill("https://mistral-gateway.example/v1");
+  await model.fill("manually-selected-model");
+  await apiKey.fill("test-api-key");
+  await expect(baseUrl).toHaveValue("https://mistral-gateway.example/v1");
+  await expect(model).toHaveValue("manually-selected-model");
+  await expect(page.getByRole("button", { name: "Save provider" })).toBeEnabled();
+
+  const presets = [
+    ["kimi", "https://api.moonshot.ai/v1", "max_completion_tokens"],
+    ["moonshot", "https://api.moonshot.cn/v1", "max_completion_tokens"],
+    ["google", "https://generativelanguage.googleapis.com/v1beta/openai", "max_tokens"],
+  ] as const;
+  for (const [kind, expectedUrl, expectedOutputField] of presets) {
+    await preset.selectOption(kind);
+    await expect(baseUrl).toHaveValue(expectedUrl);
+    await expect(model).toHaveValue("");
+    await expect(transport).toHaveValue("chat_completions");
+    await expect(transport).toBeDisabled();
+    await expect(outputField).toHaveValue(expectedOutputField);
+    await expect(outputField).toBeDisabled();
+    if (kind === "kimi") {
+      await expect(page.getByRole("combobox", { name: /^Reasoning effort/ })).toHaveCount(0);
+    } else if (kind === "moonshot") {
+      await expect(page.getByRole("combobox", { name: /^Reasoning effort/ }).locator("option")).toHaveText([
+        "Provider default (omit field)", "Low", "High", "Maximum",
+      ]);
+    }
+  }
+
+  await expect(preset.locator("option:checked")).toHaveText("Google Gemini");
+  await expect(page.getByRole("combobox", { name: /^Reasoning effort/ }).locator("option")).toHaveText([
+    "Provider default (omit field)", "None", "Minimal", "Low", "Medium", "High",
+  ]);
 });
 
 test("review, budget pause, activity, scan, and statistics flows work", async ({ page }) => {

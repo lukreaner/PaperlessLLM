@@ -1,13 +1,14 @@
 # Release process
 
-The release workflow produces four native archives and `SHA256SUMS` from an existing semantic-version tag:
+The release workflow produces five native archives and `SHA256SUMS` from an existing semantic-version tag:
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 - `aarch64-unknown-linux-musl`
 - `x86_64-unknown-linux-musl`
+- `x86_64-pc-windows-msvc`
 
-Each target runs on a native GitHub-hosted runner. The workflow installs and builds `web/` before compiling Rust so the dashboard is embedded in the executable, runs Rust tests, starts the release binary, and checks `/healthz`. Before tagging, main CI also runs the committed Playwright Chromium suite for setup, review, activity/statistics, budget-paused, and LAN-authentication flows. Archives contain the executable, license, operational documentation, and native service templates; macOS archives also contain `PaperlessLLM.app`. No container image is built or published.
+Each target runs on a native GitHub-hosted runner. The workflow installs and builds `web/` before compiling Rust so the dashboard is embedded in the executable, runs Rust tests, starts the release binary, and checks `/healthz`. Before tagging, main CI also runs the committed Playwright Chromium suite for setup, review, activity/statistics, budget-paused, and LAN-authentication flows. Archives contain the executable, license, operational documentation, and native service templates; macOS archives also contain `PaperlessLLM.app`. The Windows ZIP contains the console/service `paperless-llm.exe`, console-free `PaperlessLLM.exe`, checksummed per-user installer/uninstaller scripts, and a quick-start guide. No container image is built or published.
 
 ## Create a release
 
@@ -40,6 +41,17 @@ Configure these additional secrets to submit the signed CLI and app to Apple's n
 
 Notarization is skipped unless every signing and notarization secret is present. The release remains usable when only signing is configured.
 
+## Optional Windows Authenticode signing
+
+Without Windows signing secrets, the workflow deliberately publishes unsigned Windows executables and records that fact in the job summary. Configure both secrets to enable SHA-256 Authenticode signing with an RFC 3161 timestamp before the ZIP is assembled:
+
+| Repository secret | Value |
+| --- | --- |
+| `WINDOWS_CERTIFICATE_PFX_BASE64` | Base64-encoded Windows code-signing `.pfx` |
+| `WINDOWS_CERTIFICATE_PASSWORD` | Password protecting the `.pfx` |
+
+The workflow fails closed if only one secret is configured. It signs and verifies both `PaperlessLLM.exe` and `paperless-llm.exe`, removes the imported private key and temporary certificate after the build job, and never includes the `.pfx` in an artifact. Signing the binaries does not replace verification of the release-level `SHA256SUMS` file.
+
 ## Verify release contents
 
 Download every asset and run:
@@ -57,5 +69,14 @@ codesign --verify --deep --strict --verbose=2 PaperlessLLM.app
 xcrun stapler validate PaperlessLLM.app
 spctl --assess --type execute --verbose=4 PaperlessLLM.app
 ```
+
+For a signed Windows build, inspect both executable signatures from PowerShell after extracting the ZIP:
+
+```powershell
+Get-AuthenticodeSignature .\PaperlessLLM.exe
+Get-AuthenticodeSignature .\paperless-llm.exe
+```
+
+Both `Status` values must be `Valid`; an unsigned build reports `NotSigned` and must instead be authenticated through the release checksum and trusted repository/tag history.
 
 Start each binary with a temporary data directory and verify `http://127.0.0.1:8765/healthz` before announcing the release.
