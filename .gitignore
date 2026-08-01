@@ -1,0 +1,16 @@
+/target/
+/web/node_modules/
+/web/dist/
+/web/test-results/
+/web/playwright-report/
+/web/blob-report/
+!/web/dist/.gitkeep
+/.env
+/.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
+.paperless-llm/

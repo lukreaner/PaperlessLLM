@@ -1,0 +1,305 @@
+name: Release native binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build, for example v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be a semantic version beginning with v: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          crate_version="$(python3 -c '
+          import pathlib, tomllib
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          if manifest.get("package", {}).get("name") != "paperless-llm":
+              raise SystemExit("Cargo.toml does not describe paperless-llm")
+          print(manifest["package"]["version"])
+          ')"
+          if [[ "v$crate_version" != "$RELEASE_TAG" ]]; then
+            echo "Cargo package version v$crate_version does not match $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build embedded frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install musl compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build and test
+        run: |
+          cargo test --locked --target "${{ matrix.target }}"
+          cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Smoke test CLI and health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/paperless-llm"
+          "$binary" --help >/dev/null
+
+          smoke_dir="$RUNNER_TEMP/paperless-llm-smoke-${{ matrix.target }}"
+          log_file="$RUNNER_TEMP/paperless-llm-smoke-${{ matrix.target }}.log"
+          mkdir -p "$smoke_dir"
+          chmod 700 "$smoke_dir"
+
+          "$binary" serve \
+            --data-dir "$smoke_dir" \
+            --bind 127.0.0.1 \
+            --port 18788 \
+            --no-open >"$log_file" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..30}; do
+            if curl --silent --show-error --fail http://127.0.0.1:18788/healthz >/dev/null; then
+              exit 0
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              cat "$log_file"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          cat "$log_file"
+          exit 1
+
+      - name: Check optional Apple credentials
+        id: apple_credentials
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          signing_values=("$MACOS_CERTIFICATE_P12_BASE64" "$MACOS_CERTIFICATE_PASSWORD" "$MACOS_SIGNING_IDENTITY")
+          notary_values=("$APPLE_ID" "$APPLE_TEAM_ID" "$APPLE_APP_PASSWORD")
+
+          signing_count=0
+          for value in "${signing_values[@]}"; do [[ -n "$value" ]] && signing_count=$((signing_count + 1)); done
+          notary_count=0
+          for value in "${notary_values[@]}"; do [[ -n "$value" ]] && notary_count=$((notary_count + 1)); done
+
+          if [[ "$signing_count" -ne 0 && "$signing_count" -ne 3 ]]; then
+            echo "Configure all three macOS signing secrets or none of them." >&2
+            exit 1
+          fi
+          if [[ "$notary_count" -ne 0 && "$notary_count" -ne 3 ]]; then
+            echo "Configure all three Apple notarization secrets or none of them." >&2
+            exit 1
+          fi
+          if [[ "$notary_count" -eq 3 && "$signing_count" -ne 3 ]]; then
+            echo "Notarization credentials require a complete signing configuration." >&2
+            exit 1
+          fi
+
+          [[ "$signing_count" -eq 3 ]] && echo "signing=true" >>"$GITHUB_OUTPUT" || echo "signing=false" >>"$GITHUB_OUTPUT"
+          [[ "$notary_count" -eq 3 ]] && echo "notarization=true" >>"$GITHUB_OUTPUT" || echo "notarization=false" >>"$GITHUB_OUTPUT"
+
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS' && steps.apple_credentials.outputs.signing == 'true'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/paperless-llm-signing.p12"
+          keychain_path="$RUNNER_TEMP/paperless-llm-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "PAPERLESS_LLM_SIGNING_CERTIFICATE=$certificate_path" >>"$GITHUB_ENV"
+          echo "PAPERLESS_LLM_SIGNING_KEYCHAIN=$keychain_path" >>"$GITHUB_ENV"
+
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 -D >"$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          rm -f "$certificate_path"
+
+      - name: Sign macOS binary
+        if: runner.os == 'macOS' && steps.apple_credentials.outputs.signing == 'true'
+        shell: bash
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/paperless-llm"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --keychain "$PAPERLESS_LLM_SIGNING_KEYCHAIN" \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+
+      - name: Notarize macOS binary
+        if: runner.os == 'macOS' && steps.apple_credentials.outputs.notarization == 'true'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/paperless-llm"
+          notary_archive="$RUNNER_TEMP/paperless-llm-${{ matrix.target }}-notary.zip"
+          ditto -c -k --keepParent "$binary" "$notary_archive"
+          xcrun notarytool submit "$notary_archive" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          rm -f "$notary_archive"
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive_name="paperless-llm-${version}-${{ matrix.target }}"
+          stage="$RUNNER_TEMP/$archive_name"
+          mkdir -p "$stage"
+
+          install -m 0755 "target/${{ matrix.target }}/release/paperless-llm" "$stage/paperless-llm"
+          cp LICENSE "$stage/LICENSE"
+          cp -R docs "$stage/docs"
+          cp -R packaging "$stage/packaging"
+          tar -C "$RUNNER_TEMP" -czf "$archive_name.tar.gz" "$archive_name"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: paperless-llm-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary signing keychain
+        if: always() && runner.os == 'macOS' && env.PAPERLESS_LLM_SIGNING_KEYCHAIN != ''
+        shell: bash
+        run: |
+          security delete-keychain "$PAPERLESS_LLM_SIGNING_KEYCHAIN" || true
+          rm -f "$PAPERLESS_LLM_SIGNING_CERTIFICATE"
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Create SHA-256 checksums
+        working-directory: release-artifacts
+        run: |
+          find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\0' \
+            | sort --zero-terminated \
+            | xargs --null sha256sum >SHA256SUMS
+          test "$(wc -l <SHA256SUMS)" -eq 4
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-artifacts/* --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "PaperlessLLM $RELEASE_TAG" \
+              --generate-notes \
+              release-artifacts/*
+          fi

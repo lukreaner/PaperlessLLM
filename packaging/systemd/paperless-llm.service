@@ -1,0 +1,34 @@
+[Unit]
+Description=PaperlessLLM Paperless-ngx AI sidecar
+Documentation=https://github.com/lukreaner/PaperlessLLM
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/paperless-llm serve --data-dir %h/.local/share/paperless-llm --bind 127.0.0.1 --port 8765 --no-open
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+Environment=RUST_LOG=paperless_llm=info
+EnvironmentFile=-%h/.config/paperless-llm/environment
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/paperless-llm
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=default.target
