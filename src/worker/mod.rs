@@ -2798,7 +2798,18 @@ mod tests {
                 .mount(&server)
                 .await;
         }
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
         let (_directory, state, _) = recovery_state(&server.uri()).await;
+        sqlx::query("UPDATE provider_profiles SET base_url=? WHERE id='provider'")
+            .bind(format!("{}/v1", server.uri()))
+            .execute(state.database.pool())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status) \
              VALUES('original','profile',1,7,'checksum-retry','failed')",
@@ -2836,6 +2847,7 @@ mod tests {
                 .iter()
                 .all(|request| request.url.path() != "/api/documents/")
         );
+        server.verify().await;
     }
 
     #[tokio::test]
