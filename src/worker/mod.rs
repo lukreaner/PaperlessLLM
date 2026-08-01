@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -8,8 +11,8 @@ use chrono::{TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::FromRow;
-use tokio::sync::{RwLock, mpsc, oneshot};
-use tracing::{error, info, warn};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -22,7 +25,7 @@ use crate::{
         CustomFieldRuleRecord, PaperlessConnection, ProcessingProfileRecord, ProviderProfileRecord,
     },
     paperless::{
-        DocumentPatch, DocumentQuery, PaperlessClient, PaperlessCustomFieldValue,
+        DocumentLimit, DocumentPatch, DocumentQuery, PaperlessClient, PaperlessCustomFieldValue,
         PaperlessDocument, PaperlessNamedObject, PaperlessTag, TriggerMatchMode,
         merge_custom_fields, merge_tags,
     },
@@ -35,6 +38,7 @@ use crate::{
 
 const LEASE_MINUTES: i64 = 15;
 const DEFAULT_POLL_SECONDS: u64 = 300;
+pub(crate) const PAUSED_SETTING_KEY: &str = "worker_paused";
 const JOB_STATES: [&str; 8] = [
     "queued",
     "analyzing",
@@ -49,10 +53,20 @@ const JOB_STATES: [&str; 8] = [
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WorkerRuntimeState {
     pub state: String,
+    pub paused: bool,
     pub last_scan_at: Option<String>,
     pub next_scan_at: Option<String>,
     pub active_job_id: Option<String>,
+    pub scan_progress: Option<ScanProgress>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProgress {
+    pub trigger: String,
+    pub discovered: usize,
+    pub queued: usize,
+    pub started_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,16 +79,22 @@ pub struct ScanResult {
 
 pub(crate) enum WorkerCommand {
     Scan(oneshot::Sender<AppResult<ScanResult>>),
+    StateChanged,
 }
 
 #[derive(Clone)]
 pub struct WorkerHandle {
     sender: mpsc::Sender<WorkerCommand>,
     runtime: Arc<RwLock<WorkerRuntimeState>>,
+    paused: Arc<AtomicBool>,
+    claim_gate: Arc<Mutex<()>>,
 }
 
 impl WorkerHandle {
     pub async fn scan_now(&self) -> AppResult<ScanResult> {
+        if self.is_paused() {
+            return Err(AppError::Conflict("worker is paused".to_owned()));
+        }
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(WorkerCommand::Scan(sender))
@@ -86,33 +106,174 @@ impl WorkerHandle {
     }
 
     pub async fn runtime_state(&self) -> WorkerRuntimeState {
-        self.runtime.read().await.clone()
+        let mut runtime = self.runtime.read().await.clone();
+        runtime.paused = self.is_paused();
+        runtime
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Best-effort wake for durable database state changes. A full or closed
+    /// channel is harmless because queued work remains persisted and the next
+    /// scheduled worker turn will observe it.
+    pub fn notify_state_changed(&self) {
+        let _ = self.sender.try_send(WorkerCommand::StateChanged);
     }
 }
 
-pub(crate) fn channel() -> (WorkerHandle, mpsc::Receiver<WorkerCommand>) {
+pub(crate) fn channel(initially_paused: bool) -> (WorkerHandle, mpsc::Receiver<WorkerCommand>) {
     let (sender, receiver) = mpsc::channel(8);
     (
         WorkerHandle {
             sender,
             runtime: Arc::new(RwLock::new(WorkerRuntimeState {
-                state: "running".to_owned(),
+                state: if initially_paused {
+                    "paused"
+                } else {
+                    "running"
+                }
+                .to_owned(),
+                paused: initially_paused,
                 ..WorkerRuntimeState::default()
             })),
+            paused: Arc::new(AtomicBool::new(initially_paused)),
+            claim_gate: Arc::new(Mutex::new(())),
         },
         receiver,
     )
 }
 
-pub(crate) async fn run(state: AppState, mut receiver: mpsc::Receiver<WorkerCommand>) {
-    if let Err(error) = recover_expired_jobs(&state).await {
-        error!(%error, "could not recover expired jobs");
+pub async fn set_paused(state: &AppState, paused: bool) -> AppResult<()> {
+    // Pause and job claiming share this gate. Once this function returns, a
+    // job that was not already claimed cannot cross into `analyzing` until a
+    // later resume. Work already in flight does not hold the gate and is
+    // deliberately allowed to finish its safe apply/commit path.
+    let claim_gate = state.worker.claim_gate.lock().await;
+    state
+        .database
+        .set_setting(PAUSED_SETTING_KEY, &paused)
+        .await?;
+    state.worker.paused.store(paused, Ordering::Release);
+    let worker_status = {
+        let mut runtime = state.worker.runtime.write().await;
+        runtime.paused = paused;
+        if paused {
+            runtime.state = if runtime.active_job_id.is_some() || runtime.scan_progress.is_some() {
+                "pausing"
+            } else {
+                "paused"
+            }
+            .to_owned();
+            runtime.next_scan_at = None;
+        } else if runtime.scan_progress.is_some() {
+            runtime.state = "scanning".to_owned();
+        } else if matches!(runtime.state.as_str(), "paused" | "pausing") {
+            runtime.state = "running".to_owned();
+        }
+        runtime.state.clone()
+    };
+    drop(claim_gate);
+
+    if paused {
+        info!(
+            event = "worker.paused",
+            target = "worker",
+            status = %worker_status,
+            "worker pause requested"
+        );
+    } else {
+        info!(
+            event = "worker.resumed",
+            target = "worker",
+            status = %worker_status,
+            "worker resumed"
+        );
     }
-    if let Err(error) = process_queue(&state).await {
+
+    // Wake an idle worker so pause is reflected immediately or queued work is
+    // dispatched promptly after resume. Persistence is already complete, so a
+    // concurrently shutting-down worker does not invalidate the control state.
+    state.worker.notify_state_changed();
+    Ok(())
+}
+
+pub async fn cancel_waiting_job(state: &AppState, job_id: &str) -> AppResult<()> {
+    // Serialize with claim_next_job so cancellation either wins while the job
+    // is waiting or observes it as already in flight; it can never rewrite an
+    // analyzing/applying job underneath the worker.
+    let _gate = state.worker.claim_gate.lock().await;
+    let changed = sqlx::query(
+        "UPDATE jobs SET status='rejected', error_code='cancelled_by_user', \
+         error_message='Removed from the waiting queue by the administrator', \
+         completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), lease_owner=NULL, lease_expires_at=NULL, \
+         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE id=? AND status IN ('queued','budget_blocked')",
+    )
+    .bind(job_id)
+    .execute(state.database.pool())
+    .await?;
+    if changed.rows_affected() > 0 {
+        info!(
+            event = "document.queue_removed",
+            target = "document",
+            job_id = %job_id,
+            status = "rejected",
+            error_code = "cancelled_by_user",
+            "document removed from queue"
+        );
+        return Ok(());
+    }
+
+    let current: Option<String> = sqlx::query_scalar("SELECT status FROM jobs WHERE id=?")
+        .bind(job_id)
+        .fetch_optional(state.database.pool())
+        .await?;
+    match current {
+        None => Err(AppError::NotFound("job not found".to_owned())),
+        Some(status) => Err(AppError::Conflict(format!(
+            "job is {status}; only queued or budget-blocked jobs can be cancelled"
+        ))),
+    }
+}
+
+pub(crate) async fn run(state: AppState, mut receiver: mpsc::Receiver<WorkerCommand>) {
+    info!(
+        event = "worker.started",
+        target = "worker",
+        status = if state.worker.is_paused() {
+            "paused"
+        } else {
+            "running"
+        },
+        "worker started"
+    );
+    if !state.worker.is_paused()
+        && let Err(error) = process_queue(&state).await
+    {
         record_worker_error(&state, &error).await;
     }
 
     loop {
+        if state.worker.is_paused() {
+            mark_worker_paused(&state).await;
+            match receiver.recv().await {
+                Some(WorkerCommand::Scan(response)) => {
+                    let _ = response.send(Err(AppError::Conflict("worker is paused".to_owned())));
+                }
+                Some(WorkerCommand::StateChanged) => {
+                    if !state.worker.is_paused()
+                        && let Err(error) = process_queue(&state).await
+                    {
+                        record_worker_error(&state, &error).await;
+                    }
+                }
+                None => break,
+            }
+            continue;
+        }
+
         let poll_seconds = active_profile(&state)
             .await
             .ok()
@@ -127,60 +288,171 @@ pub(crate) async fn run(state: AppState, mut receiver: mpsc::Receiver<WorkerComm
 
         tokio::select! {
             command = receiver.recv() => {
-                let Some(WorkerCommand::Scan(response)) = command else { break; };
-                let result = discover_documents(&state).await;
-                update_scan_runtime(&state, &result).await;
-                let _ = response.send(result);
-                if let Err(error) = process_queue(&state).await {
-                    record_worker_error(&state, &error).await;
+                match command {
+                    Some(WorkerCommand::Scan(response)) => {
+                        if !try_begin_scan_runtime(&state, "manual").await {
+                            let _ = response.send(Err(AppError::Conflict("worker is paused".to_owned())));
+                            continue;
+                        }
+                        log_scan_started("manual");
+                        let result = discover_documents(&state).await;
+                        update_scan_runtime(&state, &result).await;
+                        log_scan_finished("manual", &result);
+                        let _ = response.send(result);
+                        if let Err(error) = process_queue(&state).await {
+                            record_worker_error(&state, &error).await;
+                        }
+                    }
+                    Some(WorkerCommand::StateChanged) => {
+                        if !state.worker.is_paused()
+                            && let Err(error) = process_queue(&state).await
+                        {
+                            record_worker_error(&state, &error).await;
+                        }
+                    }
+                    None => break,
                 }
             }
             () = tokio::time::sleep(Duration::from_secs(poll_seconds)) => {
+                if !try_begin_scan_runtime(&state, "scheduled").await {
+                    continue;
+                }
+                log_scan_started("scheduled");
                 let result = discover_documents(&state).await;
                 update_scan_runtime(&state, &result).await;
-                if let Err(error) = result {
-                    warn!(%error, "scheduled Paperless scan failed");
-                } else if let Err(error) = process_queue(&state).await {
+                log_scan_finished("scheduled", &result);
+                if result.is_ok()
+                    && let Err(error) = process_queue(&state).await
+                {
                     record_worker_error(&state, &error).await;
                 }
             }
         }
+    }
+}
+
+async fn mark_worker_paused(state: &AppState) {
+    let mut runtime = state.worker.runtime.write().await;
+    runtime.paused = true;
+    runtime.next_scan_at = None;
+    runtime.state = if runtime.active_job_id.is_some() || runtime.scan_progress.is_some() {
+        "pausing"
+    } else {
+        "paused"
+    }
+    .to_owned();
+}
+
+async fn try_begin_scan_runtime(state: &AppState, trigger: &str) -> bool {
+    // Serialize the final pause check with pause requests. If this function
+    // wins, scan_progress is published before pause can return; if pause wins,
+    // discovery never starts.
+    let _claim_gate = state.worker.claim_gate.lock().await;
+    if state.worker.is_paused() {
+        return false;
+    }
+    let mut runtime = state.worker.runtime.write().await;
+    runtime.paused = false;
+    runtime.state = "scanning".to_owned();
+    runtime.last_error = None;
+    runtime.scan_progress = Some(ScanProgress {
+        trigger: trigger.to_owned(),
+        discovered: 0,
+        queued: 0,
+        started_at: Utc::now().to_rfc3339(),
+    });
+    true
+}
+
+async fn update_scan_progress(state: &AppState, discovered: usize, queued: usize) {
+    let mut runtime = state.worker.runtime.write().await;
+    if let Some(progress) = runtime.scan_progress.as_mut() {
+        progress.discovered = discovered;
+        progress.queued = queued;
     }
 }
 
 async fn update_scan_runtime(state: &AppState, result: &AppResult<ScanResult>) {
     let mut runtime = state.worker.runtime.write().await;
+    runtime.paused = state.worker.is_paused();
     runtime.last_scan_at = Some(Utc::now().to_rfc3339());
+    runtime.scan_progress = None;
     match result {
         Ok(_) => {
-            runtime.state = "running".to_owned();
+            runtime.state = if runtime.paused { "paused" } else { "running" }.to_owned();
             runtime.last_error = None;
         }
         Err(error) => {
-            runtime.state = "error".to_owned();
-            runtime.last_error = Some(error.to_string());
+            runtime.state = if runtime.paused { "paused" } else { "error" }.to_owned();
+            runtime.last_error = Some(safe_error_message(error));
         }
     }
 }
 
-async fn record_worker_error(state: &AppState, error: &AppError) {
-    warn!(%error, "processing worker error");
-    let mut runtime = state.worker.runtime.write().await;
-    runtime.state = "error".to_owned();
-    runtime.last_error = Some(error.to_string());
-    runtime.active_job_id = None;
+fn log_scan_started(trigger: &'static str) {
+    info!(
+        event = "paperless.scan_started",
+        target = "paperless",
+        trigger,
+        status = "started",
+        "Paperless scan started"
+    );
 }
 
-async fn recover_expired_jobs(state: &AppState) -> AppResult<()> {
+fn log_scan_finished(trigger: &'static str, result: &AppResult<ScanResult>) {
+    match result {
+        Ok(result) => info!(
+            event = "paperless.scan_completed",
+            target = "paperless",
+            trigger,
+            status = "succeeded",
+            discovered = result.discovered,
+            queued = result.queued,
+            skipped = result.skipped,
+            "Paperless scan completed"
+        ),
+        Err(error) => warn!(
+            event = "paperless.scan_failed",
+            target = "paperless",
+            trigger,
+            status = "failed",
+            error_code = crate::diagnostics::safe_error_code(error),
+            "Paperless scan failed"
+        ),
+    }
+}
+
+async fn record_worker_error(state: &AppState, error: &AppError) {
+    warn!(
+        event = "worker.error",
+        target = "worker",
+        status = "error",
+        error_code = crate::diagnostics::safe_error_code(error),
+        "worker processing failed"
+    );
+    let mut runtime = state.worker.runtime.write().await;
+    runtime.paused = state.worker.is_paused();
+    runtime.state = if runtime.paused { "paused" } else { "error" }.to_owned();
+    runtime.last_error = Some(safe_error_message(error));
+    runtime.active_job_id = None;
+    runtime.scan_progress = None;
+}
+
+pub(crate) async fn recover_interrupted_jobs(state: &AppState) -> AppResult<()> {
+    // App startup holds the exclusive data-directory lock, so no worker from
+    // the previous process can still own a lease. Waiting for a future lease
+    // timestamp here would strand interrupted work for up to LEASE_MINUTES.
+    // Durable suggestion_json is intentionally preserved so applying jobs can
+    // replay their safe merge without another inference request.
     sqlx::query(
         "UPDATE jobs SET status='queued', lease_owner=NULL, lease_expires_at=NULL, \
          error_code='lease_recovered', error_message='Recovered after an interrupted run', \
          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-         WHERE status IN ('analyzing','applying') AND (lease_expires_at IS NULL OR lease_expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+         WHERE status IN ('analyzing','applying')",
     )
     .execute(state.database.pool())
     .await?;
-    // Re-evaluate budget-blocked jobs on every restart or scheduled scan. The
+    // Re-evaluate budget-blocked jobs on every restart. The
     // atomic reservation remains the authority and will block them again if needed.
     sqlx::query("UPDATE jobs SET status='queued', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE status='budget_blocked'")
         .execute(state.database.pool())
@@ -213,7 +485,6 @@ async fn discover_documents(state: &AppState) -> AppResult<ScanResult> {
         });
     };
     let client = paperless_client(state, &profile.paperless_connection_id).await?;
-    let tags = client.list_tags().await?;
     let trigger_tag_ids = if profile.process_pre_tagged_only {
         let selected = profile.trigger_tag_ids();
         if selected.is_empty() {
@@ -222,6 +493,7 @@ async fn discover_documents(state: &AppState) -> AppResult<ScanResult> {
                     .to_owned(),
             ));
         }
+        let tags = client.list_tags().await?;
         let known = tags
             .iter()
             .map(|tag| tag.id)
@@ -235,38 +507,57 @@ async fn discover_documents(state: &AppState) -> AppResult<ScanResult> {
     } else {
         Vec::new()
     };
-    let documents = client
-        .list_documents(&DocumentQuery {
-            trigger_tag_ids,
-            trigger_match_mode: if profile.trigger_match_mode == "all" {
-                TriggerMatchMode::All
-            } else {
-                TriggerMatchMode::Any
-            },
-            // The processed tag must not hide a new file version. The checksum
-            // uniqueness constraint is the deduplication authority.
-            excluded_tag_id: None,
-            limit: profile.max_documents_per_scan.max(1) as usize,
-        })
-        .await?;
-
+    let query = DocumentQuery {
+        trigger_tag_ids,
+        trigger_match_mode: if profile.trigger_match_mode == "all" {
+            TriggerMatchMode::All
+        } else {
+            TriggerMatchMode::Any
+        },
+        // The processed tag must not hide a new file version. The checksum
+        // uniqueness constraint is the deduplication authority.
+        excluded_tag_id: None,
+        limit: DocumentLimit::from_persisted(profile.max_documents_per_scan),
+    };
+    let mut pages = client.document_pages(&query)?;
+    let mut discovered = 0;
     let mut queued = 0;
-    for document in &documents {
-        let result = sqlx::query(
-            "INSERT INTO jobs(id, processing_profile_id, profile_revision, paperless_document_id, document_checksum, document_title, status) \
-             VALUES(?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT DO NOTHING",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&profile.id)
-        .bind(profile.revision)
-        .bind(document.id)
-        .bind(document.effective_checksum())
-        .bind(&document.title)
-        .execute(state.database.pool())
-        .await?;
-        queued += result.rows_affected() as usize;
+    while let Some(documents) = pages.next_page().await? {
+        discovered += documents.len();
+        let mut transaction = state.database.pool().begin().await?;
+        let mut inserted_jobs = Vec::new();
+        for document in documents {
+            let job_id = Uuid::new_v4().to_string();
+            let result = sqlx::query(
+                "INSERT INTO jobs(id, processing_profile_id, profile_revision, paperless_document_id, document_checksum, document_title, status) \
+                 VALUES(?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT DO NOTHING",
+            )
+            .bind(&job_id)
+            .bind(&profile.id)
+            .bind(profile.revision)
+            .bind(document.id)
+            .bind(document.effective_checksum())
+            .bind(&document.title)
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() > 0 {
+                inserted_jobs.push((job_id, document.id));
+            }
+        }
+        transaction.commit().await?;
+        queued += inserted_jobs.len();
+        update_scan_progress(state, discovered, queued).await;
+        for (job_id, document_id) in inserted_jobs {
+            info!(
+                event = "document.queued",
+                target = "document",
+                job_id = %job_id,
+                document_id,
+                status = "queued",
+                "document queued"
+            );
+        }
     }
-    let discovered = documents.len();
     Ok(ScanResult {
         discovered,
         queued,
@@ -280,6 +571,10 @@ async fn discover_documents(state: &AppState) -> AppResult<ScanResult> {
 async fn process_queue(state: &AppState) -> AppResult<()> {
     // A single worker is intentional in v1. Database claims and leases still
     // make restart recovery deterministic.
+    if state.worker.is_paused() {
+        mark_worker_paused(state).await;
+        return Ok(());
+    }
     sqlx::query(
         "UPDATE jobs SET status='queued', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE status='budget_blocked'",
     )
@@ -287,10 +582,20 @@ async fn process_queue(state: &AppState) -> AppResult<()> {
     .await?;
     loop {
         let Some(job) = claim_next_job(state).await? else {
-            state.worker.runtime.write().await.active_job_id = None;
+            let mut runtime = state.worker.runtime.write().await;
+            runtime.active_job_id = None;
+            runtime.paused = state.worker.is_paused();
+            runtime.state = if runtime.paused { "paused" } else { "running" }.to_owned();
             return Ok(());
         };
-        state.worker.runtime.write().await.active_job_id = Some(job.id.clone());
+        info!(
+            event = "document.analysis_started",
+            target = "document",
+            job_id = %job.id,
+            document_id = job.paperless_document_id,
+            status = "analyzing",
+            "document analysis started"
+        );
         if let Err(error) = process_job(state, &job).await {
             let (status, code) = if matches!(error, AppError::Budget(_)) {
                 ("budget_blocked", "budget_exhausted")
@@ -307,14 +612,41 @@ async fn process_queue(state: &AppState) -> AppResult<()> {
             .execute(state.database.pool())
             .await?;
             if status == "budget_blocked" {
+                warn!(
+                    event = "document.budget_blocked",
+                    target = "document",
+                    job_id = %job.id,
+                    document_id = job.paperless_document_id,
+                    status = "budget_blocked",
+                    error_code = code,
+                    "document processing budget blocked"
+                );
                 // Avoid immediately claiming the same blocked job forever.
+                let mut runtime = state.worker.runtime.write().await;
+                runtime.active_job_id = None;
+                runtime.paused = state.worker.is_paused();
+                runtime.state = if runtime.paused { "paused" } else { "running" }.to_owned();
                 return Ok(());
+            } else {
+                warn!(
+                    event = "document.failed",
+                    target = "document",
+                    job_id = %job.id,
+                    document_id = job.paperless_document_id,
+                    status = "failed",
+                    error_code = code,
+                    "document processing failed"
+                );
             }
         }
     }
 }
 
 async fn claim_next_job(state: &AppState) -> AppResult<Option<JobClaim>> {
+    let _claim_gate = state.worker.claim_gate.lock().await;
+    if state.worker.is_paused() {
+        return Ok(None);
+    }
     let lease_owner = Uuid::new_v4().to_string();
     let lease_expires = (Utc::now() + TimeDelta::minutes(LEASE_MINUTES)).to_rfc3339();
     let mut connection = state.database.pool().acquire().await?;
@@ -342,6 +674,13 @@ async fn claim_next_job(state: &AppState) -> AppResult<Option<JobClaim>> {
     if changed.rows_affected() == 0 {
         return Ok(None);
     }
+    // Publish the claimed job while the pause/claim gate is still held. A
+    // concurrent pause therefore cannot report an idle "paused" state after
+    // this job has already crossed into analyzing.
+    let mut runtime = state.worker.runtime.write().await;
+    runtime.active_job_id = Some(job.id.clone());
+    runtime.paused = false;
+    runtime.state = "running".to_owned();
     Ok(Some(job))
 }
 
@@ -387,6 +726,15 @@ async fn process_job(state: &AppState, job: &JobClaim) -> AppResult<()> {
         .bind(&job.id)
         .execute(state.database.pool())
         .await?;
+        info!(
+            event = "document.apply_started",
+            target = "document",
+            job_id = %job.id,
+            document_id = job.paperless_document_id,
+            trigger = "startup",
+            status = "applying",
+            "document apply started"
+        );
         return match apply_suggestion(
             state,
             &profile,
@@ -397,7 +745,7 @@ async fn process_job(state: &AppState, job: &JobClaim) -> AppResult<()> {
         )
         .await?
         {
-            ApplyOutcome::Applied => complete_job(state, &job.id).await,
+            ApplyOutcome::Applied => complete_job(state, &job.id, job.paperless_document_id).await,
             ApplyOutcome::FileVersionChanged(latest) => {
                 supersede_changed_file_job(state, job, &latest).await
             }
@@ -441,6 +789,14 @@ async fn process_job(state: &AppState, job: &JobClaim) -> AppResult<()> {
     .await?;
     let suggested = parse_suggestion(analysis.value)?;
     let constrained = constrain_suggestion(&profile, &suggested, &catalogs, &rules);
+    info!(
+        event = "document.analysis_completed",
+        target = "document",
+        job_id = %job.id,
+        document_id = job.paperless_document_id,
+        status = "succeeded",
+        "document analysis completed"
+    );
     let stored = StoredSuggestion {
         current: current_metadata(&profile, &document, &catalogs, &rules),
         suggested: suggestion_to_review(&profile, &constrained),
@@ -456,6 +812,14 @@ async fn process_job(state: &AppState, job: &JobClaim) -> AppResult<()> {
         .bind(&job.id)
         .execute(state.database.pool())
         .await?;
+        info!(
+            event = "document.awaiting_review",
+            target = "document",
+            job_id = %job.id,
+            document_id = job.paperless_document_id,
+            status = "awaiting_review",
+            "document awaiting review"
+        );
         return Ok(());
     }
 
@@ -465,6 +829,15 @@ async fn process_job(state: &AppState, job: &JobClaim) -> AppResult<()> {
         .bind(&job.id)
         .execute(state.database.pool())
         .await?;
+    info!(
+        event = "document.apply_started",
+        target = "document",
+        job_id = %job.id,
+        document_id = job.paperless_document_id,
+        trigger = "automatic",
+        status = "applying",
+        "document apply started"
+    );
     match apply_suggestion(
         state,
         &profile,
@@ -475,7 +848,7 @@ async fn process_job(state: &AppState, job: &JobClaim) -> AppResult<()> {
     )
     .await?
     {
-        ApplyOutcome::Applied => complete_job(state, &job.id).await,
+        ApplyOutcome::Applied => complete_job(state, &job.id, job.paperless_document_id).await,
         ApplyOutcome::FileVersionChanged(latest) => {
             supersede_changed_file_job(state, job, &latest).await
         }
@@ -517,6 +890,15 @@ async fn supersede_changed_file_job(
     match result {
         Ok(()) => {
             sqlx::query("COMMIT").execute(&mut *connection).await?;
+            info!(
+                event = "document.rejected",
+                target = "document",
+                job_id = %job.id,
+                document_id = job.paperless_document_id,
+                status = "rejected",
+                error_code = "file_version_changed",
+                "document processing rejected"
+            );
             Ok(())
         }
         Err(error) => {
@@ -743,12 +1125,55 @@ async fn analyze_with_one_repair(
     mut request: AnalysisRequest,
 ) -> AppResult<AnalysisResult> {
     let functions_json = serde_json::to_string(&enabled_functions(profile))?;
+    let diagnostic_provider = diagnostic_provider_kind(&provider.provider_kind);
     for attempt in 0..=1 {
         let operation = if attempt == 0 { "analysis" } else { "repair" };
-        let count = adapter
-            .count_input_tokens(&request)
-            .await
-            .map_err(provider_error)?;
+        let count_started = Instant::now();
+        info!(
+            event = "provider.request_started",
+            target = "provider",
+            job_id = %job.id,
+            document_id = job.paperless_document_id,
+            attempt = attempt + 1,
+            provider = diagnostic_provider,
+            operation = "token_count",
+            status = "started",
+            "provider token count started"
+        );
+        let count = match adapter.count_input_tokens(&request).await {
+            Ok(count) => {
+                info!(
+                    event = "provider.request_completed",
+                    target = "provider",
+                    job_id = %job.id,
+                    document_id = job.paperless_document_id,
+                    attempt = attempt + 1,
+                    provider = diagnostic_provider,
+                    operation = "token_count",
+                    status = "succeeded",
+                    input_tokens = count.input_tokens,
+                    latency_ms = count_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    "provider token count completed"
+                );
+                count
+            }
+            Err(error) => {
+                warn!(
+                    event = "provider.request_failed",
+                    target = "provider",
+                    job_id = %job.id,
+                    document_id = job.paperless_document_id,
+                    attempt = attempt + 1,
+                    provider = diagnostic_provider,
+                    operation = "token_count",
+                    status = "failed",
+                    error_code = provider_error_code(&error),
+                    latency_ms = count_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    "provider token count failed"
+                );
+                return Err(provider_error(error));
+            }
+        };
         if count.input_tokens > profile.max_input_tokens.max(1) as u64 {
             return Err(AppError::Validation(format!(
                 "{operation} input requires {} tokens, above the configured per-document limit of {}",
@@ -781,9 +1206,37 @@ async fn analyze_with_one_repair(
             )
             .await?;
         let started = Instant::now();
+        info!(
+            event = "provider.request_started",
+            target = "provider",
+            job_id = %job.id,
+            document_id = job.paperless_document_id,
+            attempt = attempt + 1,
+            provider = diagnostic_provider,
+            operation,
+            status = "started",
+            input_tokens = count.input_tokens,
+            "provider request started"
+        );
         match adapter.analyze(&request).await {
             Ok(result) => {
                 let usage = normalized_usage(&result.usage, count.input_tokens, &result.raw_text);
+                let latency = started.elapsed();
+                info!(
+                    event = "provider.request_completed",
+                    target = "provider",
+                    job_id = %job.id,
+                    document_id = job.paperless_document_id,
+                    attempt = attempt + 1,
+                    provider = diagnostic_provider,
+                    operation,
+                    status = "succeeded",
+                    input_tokens = usage.input,
+                    output_tokens = usage.output,
+                    total_tokens = usage.total,
+                    latency_ms = latency.as_millis().min(u64::MAX as u128) as u64,
+                    "provider request completed"
+                );
                 record_usage(
                     state,
                     UsageAttempt {
@@ -796,7 +1249,7 @@ async fn analyze_with_one_repair(
                         functions_json: &functions_json,
                         status: "succeeded",
                         usage: &usage,
-                        latency: started.elapsed(),
+                        latency,
                         error_code: None,
                     },
                 )
@@ -840,6 +1293,24 @@ async fn analyze_with_one_repair(
                             },
                         }
                     };
+                let error_code = provider_error_code(&error);
+                let latency = started.elapsed();
+                warn!(
+                    event = "provider.request_failed",
+                    target = "provider",
+                    job_id = %job.id,
+                    document_id = job.paperless_document_id,
+                    attempt = attempt + 1,
+                    provider = diagnostic_provider,
+                    operation,
+                    status = "failed",
+                    error_code,
+                    input_tokens = failed_usage.input,
+                    output_tokens = failed_usage.output,
+                    total_tokens = failed_usage.total,
+                    latency_ms = latency.as_millis().min(u64::MAX as u128) as u64,
+                    "provider request failed"
+                );
                 record_usage(
                     state,
                     UsageAttempt {
@@ -856,8 +1327,8 @@ async fn analyze_with_one_repair(
                         functions_json: &functions_json,
                         status: "failed",
                         usage: &failed_usage,
-                        latency: started.elapsed(),
-                        error_code: Some(provider_error_code(&error)),
+                        latency,
+                        error_code: Some(error_code),
                     },
                 )
                 .await?;
@@ -1056,6 +1527,16 @@ fn provider_error_code(error: &ProviderError) -> &'static str {
         ProviderError::InvalidResponse(_) | ProviderError::InvalidStructuredOutput { .. } => {
             "invalid_structured_output"
         }
+    }
+}
+
+fn diagnostic_provider_kind(value: &str) -> &'static str {
+    match value {
+        "openai" => "openai",
+        "claude" => "claude",
+        "lmstudio" => "lmstudio",
+        "custom" => "custom",
+        _ => "unknown",
     }
 }
 
@@ -1407,6 +1888,15 @@ pub async fn approve_review(
     if changed.rows_affected() == 0 {
         return Err(AppError::Conflict("review was already decided".to_owned()));
     }
+    info!(
+        event = "document.apply_started",
+        target = "document",
+        job_id = %job_id,
+        document_id = job.paperless_document_id,
+        trigger = "review",
+        status = "applying",
+        "document apply started"
+    );
     let outcome = apply_suggestion(
         state,
         &profile,
@@ -1417,7 +1907,7 @@ pub async fn approve_review(
     )
     .await;
     match outcome {
-        Ok(ApplyOutcome::Applied) => complete_job(state, job_id).await,
+        Ok(ApplyOutcome::Applied) => complete_job(state, job_id, job.paperless_document_id).await,
         Ok(ApplyOutcome::FileVersionChanged(latest)) => {
             let claim = JobClaim {
                 id: job.id,
@@ -1440,6 +1930,16 @@ pub async fn approve_review(
                 .bind(job_id)
                 .execute(state.database.pool())
                 .await?;
+            warn!(
+                event = "document.failed",
+                target = "document",
+                job_id = %job_id,
+                document_id = job.paperless_document_id,
+                trigger = "review",
+                status = "failed",
+                error_code = "apply_failed",
+                "document processing failed"
+            );
             Err(error)
         }
     }
@@ -1469,6 +1969,14 @@ pub async fn reject_review(state: &AppState, job_id: &str) -> AppResult<()> {
             "review was already decided or does not exist".to_owned(),
         ));
     }
+    info!(
+        event = "document.rejected",
+        target = "document",
+        job_id = %job_id,
+        trigger = "review",
+        status = "rejected",
+        "document review rejected"
+    );
     Ok(())
 }
 
@@ -1482,33 +1990,47 @@ pub async fn retry_job(state: &AppState, job_id: &str) -> AppResult<()> {
     let Some((profile_id, document_id, checksum, revision)) = row else {
         return Err(AppError::NotFound("job not found".to_owned()));
     };
+    let retry_job_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO jobs(id, processing_profile_id, profile_revision, paperless_document_id, document_checksum, status, manual_reprocess) VALUES(?, ?, ?, ?, ?, 'queued', 1)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&retry_job_id)
     .bind(profile_id)
     .bind(revision)
     .bind(document_id)
     .bind(format!("{checksum}:manual:{}", Uuid::new_v4()))
     .execute(state.database.pool())
     .await?;
-    // Wake the worker. The scan response is intentionally ignored; discovery
-    // and the queued reprocess are handled in the same worker turn.
-    let handle = state.worker.clone();
-    tokio::spawn(async move {
-        let _ = handle.scan_now().await;
-    });
+    info!(
+        event = "document.retry_queued",
+        target = "document",
+        job_id = %retry_job_id,
+        document_id,
+        trigger = "retry",
+        status = "queued",
+        "document retry queued"
+    );
+    // The retry row is already durable; waking the queue must not trigger a
+    // full Paperless rediscovery (which may contain thousands of documents).
+    state.worker.notify_state_changed();
     Ok(())
 }
 
-async fn complete_job(state: &AppState, job_id: &str) -> AppResult<()> {
+async fn complete_job(state: &AppState, job_id: &str, document_id: i64) -> AppResult<()> {
     sqlx::query(
         "UPDATE jobs SET status='completed', completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), lease_owner=NULL, lease_expires_at=NULL, error_code=NULL, error_message=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
     )
     .bind(job_id)
     .execute(state.database.pool())
     .await?;
-    info!(job_id, "document analysis completed");
+    info!(
+        event = "document.completed",
+        target = "document",
+        job_id = %job_id,
+        document_id,
+        status = "completed",
+        "document processing completed"
+    );
     Ok(())
 }
 
@@ -1865,8 +2387,7 @@ fn deterministic_sample(input: &str, token_limit: usize) -> (String, bool) {
 }
 
 fn safe_error_message(error: &AppError) -> String {
-    let message = error.to_string();
-    message.chars().take(500).collect()
+    crate::diagnostics::safe_error_summary(error)
 }
 
 fn to_i64(value: u64) -> i64 {
@@ -1880,7 +2401,7 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_partial_json, method, path},
+        matchers::{body_partial_json, method, path, query_param},
     };
 
     use super::*;
@@ -1896,7 +2417,7 @@ mod tests {
             enabled: true,
             automatic_mode: "automatic".into(),
             poll_interval_seconds: 300,
-            max_documents_per_scan: 50,
+            max_documents_per_scan: 0,
             concurrency: 1,
             use_existing_data: true,
             process_pre_tagged_only: false,
@@ -2054,7 +2575,7 @@ mod tests {
         .await
         .expect("provider");
         sqlx::query(
-            "INSERT INTO processing_profiles(id,name,paperless_connection_id,provider_profile_id,enabled,tags_enabled,correspondent_enabled,document_type_enabled,title_enabled,add_processed_tag) VALUES('profile','Default','paperless','provider',1,0,0,0,1,0)",
+            "INSERT INTO processing_profiles(id,name,paperless_connection_id,provider_profile_id,enabled,max_documents_per_scan,tags_enabled,correspondent_enabled,document_type_enabled,title_enabled,add_processed_tag) VALUES('profile','Default','paperless','provider',1,0,0,0,0,1,0)",
         )
         .execute(state.database.pool())
         .await
@@ -2071,6 +2592,226 @@ mod tests {
             warnings: Vec::new(),
         };
         (directory, state, suggestion)
+    }
+
+    #[tokio::test]
+    async fn pausing_is_durable_and_prevents_new_job_claims() {
+        let (_directory, state, _) = recovery_state("http://127.0.0.1:1").await;
+        set_paused(&state, true).await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status,lease_owner,lease_expires_at) \
+             VALUES('waiting','profile',1,1,'checksum-waiting','queued',NULL,NULL), \
+                   ('in-flight','profile',1,2,'checksum-active','analyzing','worker','2099-01-01T00:00:00Z')",
+        )
+        .execute(state.database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state
+                .database
+                .get_setting::<bool>(PAUSED_SETTING_KEY)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert!(state.worker.runtime_state().await.paused);
+        assert!(claim_next_job(&state).await.unwrap().is_none());
+
+        let states: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,status FROM jobs ORDER BY id")
+                .fetch_all(state.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                ("in-flight".to_owned(), "analyzing".to_owned()),
+                ("waiting".to_owned(), "queued".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_wins_scan_start_without_late_discovery() {
+        let (_directory, state, _) = recovery_state("http://127.0.0.1:1").await;
+        let gate = state.worker.claim_gate.lock().await;
+        let pause_state = state.clone();
+        let pause = tokio::spawn(async move { set_paused(&pause_state, true).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let scan_state = state.clone();
+        let scan = tokio::spawn(async move { try_begin_scan_runtime(&scan_state, "manual").await });
+        drop(gate);
+
+        pause.await.unwrap().unwrap();
+        assert!(!scan.await.unwrap());
+        let runtime = state.worker.runtime_state().await;
+        assert_eq!(runtime.state, "paused");
+        assert!(runtime.scan_progress.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_start_wins_before_pause_and_is_visibly_pausing() {
+        let (_directory, state, _) = recovery_state("http://127.0.0.1:1").await;
+        let gate = state.worker.claim_gate.lock().await;
+        let scan_state = state.clone();
+        let scan =
+            tokio::spawn(async move { try_begin_scan_runtime(&scan_state, "scheduled").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let pause_state = state.clone();
+        let pause = tokio::spawn(async move { set_paused(&pause_state, true).await });
+        drop(gate);
+
+        assert!(scan.await.unwrap());
+        pause.await.unwrap().unwrap();
+        let runtime = state.worker.runtime_state().await;
+        assert_eq!(runtime.state, "pausing");
+        assert!(runtime.paused);
+        assert_eq!(runtime.scan_progress.unwrap().trigger, "scheduled");
+    }
+
+    #[tokio::test]
+    async fn claimed_job_is_published_before_concurrent_pause_returns() {
+        let (_directory, state, _) = recovery_state("http://127.0.0.1:1").await;
+        sqlx::query(
+            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status) \
+             VALUES('claim-race','profile',1,99,'checksum-race','queued')",
+        )
+        .execute(state.database.pool())
+        .await
+        .unwrap();
+        let gate = state.worker.claim_gate.lock().await;
+        let claim_state = state.clone();
+        let claim = tokio::spawn(async move { claim_next_job(&claim_state).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let pause_state = state.clone();
+        let pause = tokio::spawn(async move { set_paused(&pause_state, true).await });
+        drop(gate);
+
+        let claimed = claim.await.unwrap().unwrap().expect("claimed job");
+        assert_eq!(claimed.id, "claim-race");
+        pause.await.unwrap().unwrap();
+        let runtime = state.worker.runtime_state().await;
+        assert_eq!(runtime.active_job_id.as_deref(), Some("claim-race"));
+        assert_eq!(runtime.state, "pausing");
+        assert!(runtime.paused);
+    }
+
+    #[tokio::test]
+    async fn cancelling_waiting_jobs_preserves_rows_and_usage_history() {
+        let (_directory, state, _) = recovery_state("http://127.0.0.1:1").await;
+        set_paused(&state, true).await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status,lease_owner,lease_expires_at) \
+             VALUES('queued-job','profile',1,1,'checksum-queued','queued',NULL,NULL), \
+                   ('blocked-job','profile',1,2,'checksum-blocked','budget_blocked',NULL,NULL), \
+                   ('active-job','profile',1,3,'checksum-active','analyzing','worker','2099-01-01T00:00:00Z')",
+        )
+        .execute(state.database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_events(id,job_id,provider_profile_id,provider_kind,model,api_family,status,total_tokens,usage_source) \
+             VALUES('usage','queued-job','provider','custom','model','responses','success',123,'reported')",
+        )
+        .execute(state.database.pool())
+        .await
+        .unwrap();
+
+        cancel_waiting_job(&state, "queued-job").await.unwrap();
+        cancel_waiting_job(&state, "blocked-job").await.unwrap();
+
+        let cancelled: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id,status,error_code,completed_at FROM jobs \
+             WHERE id IN ('queued-job','blocked-job') ORDER BY id",
+        )
+        .fetch_all(state.database.pool())
+        .await
+        .unwrap();
+        assert_eq!(cancelled.len(), 2);
+        assert!(cancelled.iter().all(|(_, status, reason, completed_at)| {
+            status == "rejected"
+                && reason.as_deref() == Some("cancelled_by_user")
+                && completed_at.is_some()
+        }));
+        let usage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM usage_events WHERE job_id='queued-job'")
+                .fetch_one(state.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(usage_count, 1);
+        assert!(matches!(
+            cancel_waiting_job(&state, "active-job").await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            cancel_waiting_job(&state, "missing-job").await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_wakes_durable_queue_without_running_full_discovery() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/documents/7/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 7,
+                "title": "Retry me",
+                "content": "OCR",
+                "versions": [{"id": 70, "checksum": "checksum-retry"}]
+            })))
+            .mount(&server)
+            .await;
+        for endpoint in ["/api/tags/", "/api/correspondents/", "/api/document_types/"] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "count": 0,
+                    "next": null,
+                    "results": []
+                })))
+                .mount(&server)
+                .await;
+        }
+        let (_directory, state, _) = recovery_state(&server.uri()).await;
+        sqlx::query(
+            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status) \
+             VALUES('original','profile',1,7,'checksum-retry','failed')",
+        )
+        .execute(state.database.pool())
+        .await
+        .unwrap();
+
+        retry_job(&state, "original").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM jobs WHERE manual_reprocess=1 ORDER BY queued_at DESC LIMIT 1",
+                )
+                .fetch_one(state.database.pool())
+                .await
+                .unwrap();
+                if !matches!(status.as_str(), "queued" | "analyzing" | "applying") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retry dispatch");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/api/documents/7/")
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/documents/")
+        );
     }
 
     #[tokio::test]
@@ -2108,13 +2849,15 @@ mod tests {
 
         let (_directory, state, suggestion) = recovery_state(&server.uri()).await;
         sqlx::query(
-            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status,suggestion_json) VALUES('job','profile',1,1,'checksum-a','queued',?)",
+            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status,lease_owner,lease_expires_at,suggestion_json) \
+             VALUES('job','profile',1,1,'checksum-a','applying','previous-process','2999-01-01T00:00:00Z',?)",
         )
         .bind(serde_json::to_string(&suggestion).unwrap())
         .execute(state.database.pool())
         .await
         .unwrap();
 
+        recover_interrupted_jobs(&state).await.unwrap();
         process_queue(&state).await.unwrap();
 
         let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id='job'")
@@ -2128,6 +2871,71 @@ mod tests {
         assert_eq!(status, "completed");
         assert_eq!(usage_events, 0);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn app_startup_immediately_recovers_a_future_lease_and_keeps_suggestion() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let database = crate::db::Database::connect(&directory.path().join("paperless-llm.db"))
+            .await
+            .expect("database");
+        let suggestion = serde_json::to_string(&StoredSuggestion {
+            current: ReviewSuggestion::default(),
+            suggested: ReviewSuggestion {
+                title: Some("Already analyzed".to_owned()),
+                ..ReviewSuggestion::default()
+            },
+            warnings: vec!["preserve me".to_owned()],
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO paperless_connections(id,name,base_url,token_secret_key) \
+             VALUES('paperless','Paperless','http://127.0.0.1:1','paperless:test'); \
+             INSERT INTO provider_profiles(id,name,provider_kind,base_url,model,api_family) \
+             VALUES('provider','Provider','custom','http://127.0.0.1:1/v1','model','responses'); \
+             INSERT INTO processing_profiles(id,name,paperless_connection_id,provider_profile_id,enabled) \
+             VALUES('profile','Default','paperless','provider',1); \
+             INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status,lease_owner,lease_expires_at,suggestion_json) \
+             VALUES('interrupted','profile',1,42,'checksum','applying','old-process','2999-01-01T00:00:00Z',?)",
+        )
+        .bind(&suggestion)
+        .execute(database.pool())
+        .await
+        .expect("interrupted job");
+        database
+            .set_setting(PAUSED_SETTING_KEY, &true)
+            .await
+            .expect("paused startup");
+        database.pool().close().await;
+        drop(database);
+
+        let state = app::initialize(RuntimeOptions {
+            data_dir: directory.path().to_path_buf(),
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            open_browser: false,
+        })
+        .await
+        .expect("application state");
+
+        let recovered: (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status,lease_owner,lease_expires_at,suggestion_json,error_code \
+                 FROM jobs WHERE id='interrupted'",
+        )
+        .fetch_one(state.database.pool())
+        .await
+        .expect("recovered job");
+        assert_eq!(recovered.0, "queued");
+        assert_eq!(recovered.1, None);
+        assert_eq!(recovered.2, None);
+        assert_eq!(recovered.3.as_deref(), Some(suggestion.as_str()));
+        assert_eq!(recovered.4.as_deref(), Some("lease_recovered"));
     }
 
     #[tokio::test]
@@ -2236,7 +3044,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_recovery_only_requeues_expired_work_and_budget_pauses() {
+    async fn long_scan_reports_committed_page_progress_and_pauses_afterward() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/documents/"))
+            .and(query_param("page_size", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 2,
+                "next": format!("{}/api/documents/?page=2", server.uri()),
+                "results": [{
+                    "id": 1,
+                    "title": "First",
+                    "versions": [{"id": 10, "checksum": "checksum-1"}]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/documents/"))
+            .and(query_param("page", "2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(json!({
+                        "count": 2,
+                        "next": null,
+                        "results": [{
+                            "id": 2,
+                            "title": "Second",
+                            "versions": [{"id": 20, "checksum": "checksum-2"}]
+                        }]
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_directory, state, _) = recovery_state(&server.uri()).await;
+        let worker = state.worker.clone();
+        let scan = tokio::spawn(async move { worker.scan_now().await });
+
+        let progress = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let runtime = state.worker.runtime_state().await;
+                if runtime
+                    .scan_progress
+                    .as_ref()
+                    .is_some_and(|progress| progress.discovered == 1)
+                {
+                    break runtime;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first committed page progress");
+        assert_eq!(progress.state, "scanning");
+        let progress = progress.scan_progress.unwrap();
+        assert_eq!((progress.discovered, progress.queued), (1, 1));
+        assert_eq!(progress.trigger, "manual");
+
+        set_paused(&state, true).await.unwrap();
+        let pausing = state.worker.runtime_state().await;
+        assert_eq!(pausing.state, "pausing");
+        assert!(pausing.scan_progress.is_some());
+
+        let result = tokio::time::timeout(Duration::from_secs(2), scan)
+            .await
+            .expect("scan completion")
+            .expect("scan task")
+            .expect("scan result");
+        assert_eq!((result.discovered, result.queued), (2, 2));
+        let paused = state.worker.runtime_state().await;
+        assert_eq!(paused.state, "paused");
+        assert!(paused.scan_progress.is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn hostile_provider_echo_is_never_persisted_in_job_errors() {
+        const HOSTILE_OCR: &str = "OCR_PRIVATE_JOB_ECHO_0c72";
+        const HOSTILE_PROMPT: &str = "PROMPT_PRIVATE_JOB_ECHO_b315";
+        const HOSTILE_TOKEN: &str = "sk-hostile-job-token";
+
+        let paperless = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/documents/1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 1,
+                "title": "Private document",
+                "content": HOSTILE_OCR,
+                "versions": [{"id": 10, "checksum": "checksum-a"}]
+            })))
+            .expect(1)
+            .mount(&paperless)
+            .await;
+        for endpoint in ["/api/tags/", "/api/correspondents/", "/api/document_types/"] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "count": 0,
+                    "next": null,
+                    "results": []
+                })))
+                .expect(1)
+                .mount(&paperless)
+                .await;
+        }
+
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": format!(
+                        "provider echoed {HOSTILE_OCR} {HOSTILE_PROMPT} {HOSTILE_TOKEN}"
+                    )
+                }
+            })))
+            .expect(1)
+            .mount(&provider)
+            .await;
+
+        let (_directory, state, _) = recovery_state(&paperless.uri()).await;
+        sqlx::query(
+            "UPDATE provider_profiles SET base_url=?, model='mock-model' WHERE id='provider'",
+        )
+        .bind(format!("{}/v1", provider.uri()))
+        .execute(state.database.pool())
+        .await
+        .expect("provider fixture");
+        sqlx::query(
+            "INSERT INTO jobs(id,processing_profile_id,profile_revision,paperless_document_id,document_checksum,status) \
+             VALUES('hostile-job','profile',1,1,'checksum-a','queued')",
+        )
+        .execute(state.database.pool())
+        .await
+        .expect("job fixture");
+
+        process_queue(&state).await.expect("queue processing");
+
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status,error_message FROM jobs WHERE id='hostile-job'")
+                .fetch_one(state.database.pool())
+                .await
+                .expect("failed job");
+        assert_eq!(status, "failed");
+        let error = error.expect("safe job error");
+        assert_eq!(error, "Provider request failed with HTTP 400");
+        assert!(!error.contains(HOSTILE_OCR));
+        assert!(!error.contains(HOSTILE_PROMPT));
+        assert!(!error.contains(HOSTILE_TOKEN));
+        paperless.verify().await;
+        provider.verify().await;
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_requeues_all_interrupted_work_and_budget_pauses() {
         let (_directory, state, suggestion) = recovery_state("http://127.0.0.1:1").await;
         for (id, status, expiry, suggestion_json) in [
             (
@@ -2278,20 +3242,47 @@ mod tests {
             .unwrap();
         }
 
-        recover_expired_jobs(&state).await.unwrap();
+        recover_interrupted_jobs(&state).await.unwrap();
 
-        let rows: Vec<(String, String, Option<String>)> =
-            sqlx::query_as("SELECT id,status,suggestion_json FROM jobs ORDER BY id")
-                .fetch_all(state.database.pool())
-                .await
-                .unwrap();
+        type RecoveryRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<RecoveryRow> = sqlx::query_as(
+            "SELECT id,status,suggestion_json,lease_owner,lease_expires_at FROM jobs ORDER BY id",
+        )
+        .fetch_all(state.database.pool())
+        .await
+        .unwrap();
         let states = rows
             .into_iter()
-            .map(|(id, status, suggestion)| (id, (status, suggestion.is_some())))
+            .map(|(id, status, suggestion, owner, expiry)| {
+                (id, (status, suggestion.is_some(), owner, expiry))
+            })
             .collect::<HashMap<_, _>>();
-        assert_eq!(states["expired-analysis"], ("queued".to_owned(), false));
-        assert_eq!(states["expired-apply"], ("queued".to_owned(), true));
-        assert_eq!(states["live-apply"], ("applying".to_owned(), true));
-        assert_eq!(states["budget"], ("queued".to_owned(), false));
+        assert_eq!(
+            states["expired-analysis"],
+            ("queued".to_owned(), false, None, None)
+        );
+        assert_eq!(
+            states["expired-apply"],
+            ("queued".to_owned(), true, None, None)
+        );
+        assert_eq!(
+            states["live-apply"],
+            ("queued".to_owned(), true, None, None)
+        );
+        assert_eq!(
+            states["budget"],
+            (
+                "queued".to_owned(),
+                false,
+                None,
+                Some("2999-01-01T00:00:00Z".to_owned())
+            )
+        );
     }
 }

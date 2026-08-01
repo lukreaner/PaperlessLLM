@@ -4,8 +4,10 @@ import type { Job, JobState } from "../api/types";
 import { useApp } from "../App";
 import { useToast } from "../components/Toast";
 import { Badge, Button, Card, ErrorState, PageHeader, ProgressBar, Skeleton, StatusDot } from "../components/UI";
+import { WorkerControls } from "../components/WorkerControls";
+import { WorkerLiveStatus } from "../components/WorkerLiveStatus";
 import { budgetPercent, formatRelativeTime, formatTokens, titleCase } from "../lib/format";
-import { useAsync } from "../lib/hooks";
+import { useAsync, usePollingStale, useVisiblePolling } from "../lib/hooks";
 import { Link } from "../lib/router";
 
 const stateTone: Record<JobState, "neutral" | "success" | "warning" | "danger" | "info" | "accent"> = {
@@ -13,11 +15,16 @@ const stateTone: Record<JobState, "neutral" | "success" | "warning" | "danger" |
 };
 
 export function OverviewPage() {
-  const { status, settings, providers, refreshStatus } = useApp();
+  const { status, settings, providers, statusLastSuccessAt, statusPollError, refreshStatus } = useApp();
   const [scanning, setScanning] = useState(false);
   const { showToast } = useToast();
   const stats = useAsync(() => api.statsSummary("month"), []);
   const jobs = useAsync(() => api.jobs({ limit: 6, offset: 0 }), []);
+
+  useVisiblePolling(jobs.refreshSilently, 2_000);
+  useVisiblePolling(stats.refreshSilently, 15_000);
+  const jobsStale = usePollingStale(jobs.lastSuccessAt, jobs.backgroundError);
+  const statusStale = usePollingStale(statusLastSuccessAt, statusPollError);
 
   async function scan() {
     setScanning(true);
@@ -37,17 +44,20 @@ export function OverviewPage() {
   const monthlyPercent = daily ? budgetPercent(daily.monthly_used, daily.monthly_limit) : 0;
   const dailyPercent = daily ? budgetPercent(daily.daily_used, daily.daily_limit) : 0;
   const activeProvider = providers.find((provider) => provider.id === settings.active_provider_id || provider.active);
+  const paused = status.worker.paused || status.worker.state === "paused";
 
   return (
     <div className="page">
-      <PageHeader eyebrow="Control room" title="Overview" description="Your document pipeline at a glance." actions={<Button loading={scanning} onClick={() => void scan()}><span aria-hidden="true">↻</span> Scan now</Button>} />
+      <PageHeader eyebrow="Control room" title="Overview" description="Your document pipeline at a glance." actions={<div className="page-actions"><WorkerControls onChanged={jobs.refreshSilently} /><Button loading={scanning} disabled={paused} title={paused ? "Continue processing before starting a scan" : undefined} onClick={() => void scan()}><span aria-hidden="true">↻</span> Scan now</Button></div>} />
 
       {(status.queue.budget_blocked ?? 0) > 0 && (
         <div className="budget-banner"><span>!</span><div><strong>{status.queue.budget_blocked} job{status.queue.budget_blocked === 1 ? " is" : "s are"} waiting for a token budget reset</strong><p>Processing resumes automatically after reset or when you raise the limit.</p></div><Link to="/settings?section=limits">Review limits</Link></div>
       )}
 
+      <WorkerLiveStatus worker={status.worker} lastSuccessAt={statusLastSuccessAt} pollError={statusPollError} />
+
       <div className="metric-grid">
-        <MetricCard label="Active queue" value={queueTotal.toLocaleString()} meta={(status.queue.analyzing ?? 0) > 0 ? `${status.queue.analyzing} analyzing now` : "Worker is ready"} mark="Q" tone="accent" />
+        <MetricCard label="Active queue" value={queueTotal.toLocaleString()} meta={status.worker.active_job ? `${paused ? "Finishing" : "Working on"} document #${status.worker.active_job.document_id}` : status.worker.scan_progress ? `${paused ? "Finishing scan" : "Scanning"} · ${status.worker.scan_progress.discovered.toLocaleString()} discovered` : paused ? "Processing is paused" : "Worker is ready"} mark="Q" tone="accent" />
         <MetricCard label="Awaiting review" value={(status.queue.awaiting_review ?? 0).toLocaleString()} meta={status.queue.awaiting_review ? "Your decision needed" : "All caught up"} mark="R" tone="gold" link="/review" />
         <MetricCard label="Tokens this month" value={stats.loading ? undefined : stats.error ? "—" : formatTokens(stats.data?.totals.total_tokens ?? 0)} meta={stats.data ? `${stats.data.totals.requests.toLocaleString()} AI requests` : "Usage unavailable"} mark="T" tone="violet" />
         <MetricCard label="Completed" value={(status.queue.completed ?? 0).toLocaleString()} meta="In recorded history" mark="✓" tone="green" />
@@ -55,7 +65,7 @@ export function OverviewPage() {
 
       <div className="overview-grid">
         <Card className="pipeline-card" padded={false}>
-          <div className="card-heading card-heading--padded"><div><span className="eyebrow">Recent activity</span><h2>Document pipeline</h2></div><Link className="text-link" to="/activity">View all →</Link></div>
+          <div className="card-heading card-heading--padded"><div><span className="eyebrow">Recent activity</span><h2>Document pipeline <span className={`live-label ${jobsStale ? "live-label--stale" : ""}`}><i />{jobsStale ? "Reconnecting" : "Live"}</span></h2></div><Link className="text-link" to="/activity">View all →</Link></div>
           {jobs.loading ? <TableSkeleton /> : jobs.error ? <div className="inset-error"><p>{jobs.error}</p><Button size="sm" variant="ghost" onClick={() => void jobs.refresh()}>Retry</Button></div> : !jobs.data?.items.length ? (
             <div className="pipeline-empty"><span>◎</span><h3>No documents processed yet</h3><p>Run a scan to discover documents that match your processing rules.</p><Button variant="secondary" size="sm" onClick={() => void scan()}>Run first scan</Button></div>
           ) : (
@@ -69,7 +79,7 @@ export function OverviewPage() {
             <div className="health-list">
               <HealthRow label="Paperless-ngx" detail={status.paperless.message ?? settings.paperless.base_url} state={status.paperless.state} />
               <HealthRow label={activeProvider?.name ?? "AI provider"} detail={activeProvider?.model || status.provider.message || "Not configured"} state={status.provider.state} />
-              <HealthRow label="Processing worker" detail={status.worker.next_scan_at ? `Next scan ${formatRelativeTime(status.worker.next_scan_at)}` : "Ready for a manual scan"} state={status.worker.state === "running" ? "connected" : status.worker.state === "paused" ? "degraded" : "disconnected"} />
+              <HealthRow label="Processing worker" detail={statusStale ? "Live status unavailable — reconnecting" : status.worker.active_job ? `Document #${status.worker.active_job.document_id} is ${titleCase(status.worker.active_job.state)}${paused ? "; pausing afterward" : ""}` : status.worker.scan_progress ? `${titleCase(status.worker.scan_progress.trigger)} scan: ${status.worker.scan_progress.discovered.toLocaleString()} discovered, ${status.worker.scan_progress.queued.toLocaleString()} queued${paused ? "; pausing afterward" : ""}` : paused ? "Paused — queued documents are preserved" : status.worker.next_scan_at ? `Next scan ${formatRelativeTime(status.worker.next_scan_at)}` : "Ready for a manual scan"} state={statusStale ? "disconnected" : status.worker.state === "running" || status.worker.state === "scanning" ? "connected" : paused ? "degraded" : "disconnected"} />
             </div>
           </Card>
           <Card>

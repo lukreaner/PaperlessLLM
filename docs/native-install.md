@@ -146,7 +146,7 @@ For foreground operation instead:
   --open-browser
 ```
 
-PaperlessLLM creates a mode-`0600` `.master-key` in the data directory unless `PAPERLESSLLM_MASTER_KEY` is supplied. An environment-provided key must be exactly 32 bytes encoded as base64 or hexadecimal. Do not rotate or delete that key while encrypted secrets remain in the database.
+PaperlessLLM creates a mode-`0600` `.master-key` in the data directory unless `PAPERLESSLLM_MASTER_KEY` is supplied. An environment-provided key must be exactly 32 bytes encoded as base64 or hexadecimal. Supply it through a credential manager or equivalently protected service environment, not a committed `.env` file, shell history, or world-readable unit. Do not rotate or delete that key while encrypted secrets remain in the database; there is no in-place rekey operation.
 
 ### Run as a systemd user service
 
@@ -169,15 +169,48 @@ sudo loginctl enable-linger "$USER"
 
 View logs with `journalctl --user -u paperless-llm.service -f`.
 
-## Stop a desktop-launched service
+## Stop PaperlessLLM
 
-Closing the browser does not stop PaperlessLLM; the worker intentionally remains active. Before upgrading or uninstalling a copy started with `launch` or by double-clicking, stop the `paperless-llm` process in macOS Activity Monitor or the Linux system monitor. On Linux, the equivalent terminal command is:
+Closing the browser does not stop PaperlessLLM; it closes only the dashboard tab while the worker intentionally remains active. To stop a copy started with `launch`, by double-clicking `PaperlessLLM.app`, or from the Linux application menu, open the dashboard and choose **Quit PaperlessLLM** at the bottom of the sidebar. Confirm **Quit PaperlessLLM** in the dialog to stop the worker gracefully. Launch the app again whenever you want to restart it.
+
+If the dashboard is unavailable, use macOS Activity Monitor or the Linux system monitor. On Linux, the equivalent terminal fallback is:
 
 ```sh
 pkill -TERM -x paperless-llm
 ```
 
-For a managed service, use `launchctl bootout` or `systemctl --user stop paperless-llm.service` instead. Double-clicking the app or choosing the application-menu entry starts it again.
+Do not use the dashboard Quit control for an instance managed by launchd or systemd. The service manager owns that process and may restart it after a dashboard-requested exit. Stop or unload it through the same manager instead:
+
+```sh
+# macOS launchd
+launchctl bootout "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/io.paperlessllm.paperless-llm.plist"
+
+# Linux systemd user service
+systemctl --user stop paperless-llm.service
+```
+
+## View diagnostic logs
+
+Open **Logs** in the dashboard sidebar to view recent desktop-launcher service events and the current worker state. The view polls every five seconds while the page is visible, can be paused or refreshed manually, and supports safe-field search plus level and subsystem filters.
+
+The API does not send raw log messages to the browser. It maps recognized lines to fixed event and subsystem names and returns only validated operational fields such as status, counts, document/job identifiers, and normalized error codes. Unknown messages are shown as a generic service event. Prompts, OCR/document content, credentials, headers, local filesystem paths, model names, and upstream response bodies are not included.
+
+The desktop child keeps `paperless-llm.log` below roughly 4 MiB and retains one previous generation as `paperless-llm.log.previous`, so diagnostic storage remains below roughly 8 MiB plus small headers and a lock file. Starting a new desktop service rotates a versioned prior current log instead of deleting it. Both generations and the writer lock are private `0600` files. The dashboard deliberately reads only the current generation, with the newest entries first; it never exposes the previous or temporary rotation file. During the first launch after upgrading, an unversioned legacy log is deleted rather than retained because older output may not meet the current privacy contract. Quit and restart PaperlessLLM once before opening **Logs** after an upgrade.
+
+The dashboard log is intended for instances started through `paperless-llm launch`, the macOS app, or the Linux desktop entry. For launchd-managed instances, inspect the configured `stdout.log` and `stderr.log` files. For systemd-managed instances, continue to use:
+
+```sh
+journalctl --user -u paperless-llm.service -f
+```
+
+## Scan and control the queue
+
+PaperlessLLM discovers every matching Paperless document by default. It requests bounded, minimal Paperless pages and updates the Overview scan counter after each committed page, so a library with thousands of documents does not stop after 50 or need to be loaded into memory at once. In **Settings → Processing**, leave **Maximum documents per scan** empty for this behavior or enter a deliberate cap.
+
+Overview and Activity update roughly every two seconds while the tab is visible. Both pages show the document currently being analyzed/applied or the live discovery totals. Use **Pause processing** to prevent the next scan or job from starting; an operation already in flight finishes its safe boundary first. The paused state survives a restart, and **Continue processing** resumes the durable queue immediately.
+
+To remove a waiting item, expand its Activity row and choose **Remove from queue**. Only `queued` and `budget-blocked` jobs can be removed; an analyzing/applying job is allowed to finish. Removal retains the activity and token-usage audit record. The same document can be queued again through **Reprocess**, or automatically when Paperless receives a new file version.
 
 ## Initial configuration
 
@@ -192,7 +225,7 @@ Keep the service on `127.0.0.1` for a single-machine installation. Before making
 
 ## Upgrade and uninstall
 
-Back up the data directory before an upgrade. Stop the service, replace only the executable, and start it again; embedded database migrations run at startup. Database migrations are forward-only, so keep the matching backup until the new version has been verified.
+Back up the data directory before an upgrade. The documented backup is a sensitive plaintext archive until separately encrypted. Stop the service, replace only the executable, and start it again; embedded database migrations run at startup. Database migrations are forward-only, so keep the matching encrypted backup until the new version has been verified.
 
 Uninstalling the executable does not remove configuration or statistics. A Linux application-menu installation can be removed with:
 
@@ -201,4 +234,6 @@ rm "$HOME/.local/bin/paperless-llm"
 rm "${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.paperlessllm.PaperlessLLM.desktop"
 ```
 
-Remove a separately created `PaperlessLLM.desktop` shortcut from the desktop in the usual file-manager way. Delete the data directory only when its configuration, statistics, and encrypted credentials are no longer needed.
+Remove a separately created `PaperlessLLM.desktop` shortcut from the desktop in the usual file-manager way. On Linux, also remove any externally supplied `PAPERLESSLLM_MASTER_KEY` from its credential manager when it is no longer used. Delete the data directory only when its configuration, statistics, and encrypted credentials are no longer needed.
+
+On macOS, deleting `PaperlessLLM.app` or its data directory does not delete Keychain-backed credentials. After stopping PaperlessLLM, open **Keychain Access**, search for generic-password entries whose service is `com.paperless-llm.credentials`, and remove only the entries belonging to the PaperlessLLM instance being retired. If other PaperlessLLM data directories are still in use, verify the entry account before deleting it. Then remove the data directory and any plaintext backups only when their configuration, history, fallback credentials, and statistics are no longer needed.

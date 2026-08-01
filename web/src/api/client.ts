@@ -6,6 +6,7 @@ import type {
   Catalogs,
   CatalogItem,
   CreateCustomFieldRequest,
+  DiagnosticLogs,
   JobsResponse,
   PaperlessTestResult,
   ProviderProfile,
@@ -15,6 +16,8 @@ import type {
   ScanResult,
   StatsSeries,
   StatsSummary,
+  WorkerStatus,
+  CancelJobResult,
 } from "./types";
 
 let csrfToken: string | undefined;
@@ -47,8 +50,9 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
 
   let response: Response;
   try {
-    response = await fetch(path, { ...init, headers, credentials: "same-origin" });
+    response = await fetch(path, { ...init, headers, cache: "no-store", credentials: "same-origin" });
   } catch {
+    if (init.signal?.aborted) throw new ApiError("PaperlessLLM did not answer in time. Retrying automatically.", 0);
     throw new ApiError("PaperlessLLM is not reachable. Check that the service is running.", 0);
   }
 
@@ -68,6 +72,12 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   return body as T;
 }
 
+function timedGet<T>(path: string, timeoutMs = 10_000): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  return apiRequest<T>(path, { signal: controller.signal }).finally(() => window.clearTimeout(timer));
+}
+
 function json(method: string, value?: unknown): RequestInit {
   return { method, body: value === undefined ? undefined : JSON.stringify(value) };
 }
@@ -82,7 +92,7 @@ function queryString(params: Record<string, string | number | undefined>): strin
 }
 
 export const api = {
-  status: () => apiRequest<AppStatus>("/api/status"),
+  status: () => timedGet<AppStatus>("/api/status"),
   bootstrap: async () => {
     const result = await apiRequest<BootstrapResponse>("/api/bootstrap");
     csrfToken = result.status.auth.csrf_token;
@@ -105,6 +115,10 @@ export const api = {
       csrfToken = undefined;
     }
   },
+  shutdown: () => apiRequest<{ ok: boolean }>("/api/shutdown", {
+    method: "POST",
+    headers: { "X-PaperlessLLM-Action": "shutdown" },
+  }),
   setPassword: (password: string, current_password?: string) =>
     apiRequest<{ ok: boolean }>("/api/auth/password", json("PUT", { password, current_password })),
   getSettings: () => apiRequest<AppSettings>("/api/settings"),
@@ -126,9 +140,14 @@ export const api = {
   testProvider: (id: string) =>
     apiRequest<ProviderTestResult>(`/api/providers/${encodeURIComponent(id)}/test`, json("POST")),
   scan: () => apiRequest<ScanResult>("/api/scan", json("POST")),
+  workerStatus: () => apiRequest<WorkerStatus>("/api/worker"),
+  pauseWorker: () => apiRequest<WorkerStatus>("/api/worker/pause", { method: "POST", headers: { "X-PaperlessLLM-Action": "worker-control" } }),
+  resumeWorker: () => apiRequest<WorkerStatus>("/api/worker/resume", { method: "POST", headers: { "X-PaperlessLLM-Action": "worker-control" } }),
+  logs: () => timedGet<DiagnosticLogs>("/api/logs"),
   jobs: (params: { state?: string; q?: string; limit?: number; offset?: number } = {}) =>
-    apiRequest<JobsResponse>(`/api/jobs${queryString(params)}`),
+    timedGet<JobsResponse>(`/api/jobs${queryString(params)}`),
   retryJob: (id: string) => apiRequest<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}/retry`, json("POST")),
+  cancelJob: (id: string) => apiRequest<CancelJobResult>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", headers: { "X-PaperlessLLM-Action": "worker-control" } }),
   reviews: () => apiRequest<ReviewsResponse>("/api/reviews"),
   approveReview: (id: string, suggestion: ReviewSuggestion) =>
     apiRequest<{ ok: boolean }>(`/api/reviews/${encodeURIComponent(id)}/approve`, json("POST", { suggestion })),

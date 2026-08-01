@@ -1,4 +1,8 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use reqwest::{
@@ -13,7 +17,7 @@ use zeroize::Zeroizing;
 use crate::{AppError, AppResult};
 
 const API_ACCEPT: &str = "application/json; version=10";
-const MAX_ERROR_CHARS: usize = 500;
+const PAPERLESS_PAGE_SIZE: usize = 1_000;
 
 #[derive(Clone)]
 pub struct PaperlessClient {
@@ -115,6 +119,29 @@ impl PaperlessDocument {
     }
 }
 
+/// The deliberately small representation used while discovering work.
+///
+/// OCR content and mutable Paperless metadata are fetched only after a job is
+/// claimed via [`PaperlessClient::get_document`]. Keeping discovery records
+/// small lets an unlimited scan enqueue one bounded API page at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperlessDocumentSummary {
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub versions: Vec<PaperlessDocumentVersion>,
+}
+
+impl PaperlessDocumentSummary {
+    pub fn effective_checksum(&self) -> String {
+        self.versions
+            .first()
+            .and_then(|version| version.checksum.clone())
+            .unwrap_or_else(|| format!("document-{}", self.id))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DocumentPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,12 +170,92 @@ pub enum TriggerMatchMode {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentLimit {
+    All,
+    UpTo(NonZeroUsize),
+}
+
+impl DocumentLimit {
+    /// Converts the processing-profile representation into an explicit query
+    /// limit. Zero and negative legacy values mean "all matching documents".
+    pub fn from_persisted(value: i64) -> Self {
+        usize::try_from(value)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .map(Self::UpTo)
+            .unwrap_or(Self::All)
+    }
+
+    fn max_results(self) -> Option<usize> {
+        match self {
+            Self::All => None,
+            Self::UpTo(limit) => Some(limit.get()),
+        }
+    }
+
+    fn page_size(self) -> usize {
+        self.max_results()
+            .unwrap_or(PAPERLESS_PAGE_SIZE)
+            .min(PAPERLESS_PAGE_SIZE)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentQuery {
     pub trigger_tag_ids: Vec<i64>,
     pub trigger_match_mode: TriggerMatchMode,
     pub excluded_tag_id: Option<i64>,
-    pub limit: usize,
+    pub limit: DocumentLimit,
+}
+
+/// A memory-bounded cursor over Paperless document discovery results.
+///
+/// At most one configured Paperless page is retained by the caller. The
+/// cursor preserves the same pagination validation, proxy-link rebasing, and
+/// repeated-page protections used by the other collection endpoints.
+pub struct DocumentPages<'a> {
+    client: &'a PaperlessClient,
+    endpoint: &'static str,
+    next_url: Option<Url>,
+    visited: HashSet<String>,
+    remaining: Option<usize>,
+}
+
+impl DocumentPages<'_> {
+    pub async fn next_page(&mut self) -> AppResult<Option<Vec<PaperlessDocumentSummary>>> {
+        let Some(url) = self.next_url.take() else {
+            return Ok(None);
+        };
+        self.client.ensure_same_origin(&url)?;
+        if !self.visited.insert(url.to_string()) {
+            return Err(AppError::Upstream(
+                "Paperless pagination repeated a page".to_owned(),
+            ));
+        }
+
+        let response = self
+            .client
+            .request(Method::GET, url.clone())
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let mut page: Paginated<PaperlessDocumentSummary> = decode_success(response).await?;
+
+        if let Some(remaining) = self.remaining {
+            page.results.truncate(remaining);
+            let new_remaining = remaining.saturating_sub(page.results.len());
+            self.remaining = Some(new_remaining);
+            if new_remaining == 0 {
+                return Ok(Some(page.results));
+            }
+        }
+
+        if let Some(next) = page.next {
+            self.next_url = Some(self.client.pagination_url(&url, self.endpoint, &next)?);
+        }
+        Ok(Some(page.results))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -217,21 +324,27 @@ impl PaperlessClient {
             .ok_or_else(|| {
                 AppError::Upstream("Paperless did not report an API version".to_owned())
             })?;
-        let server_version = response
+        let raw_server_version = response
             .headers()
             .get("x-version")
             .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
+            .unwrap_or_default();
         if api_version != 10 {
             return Err(AppError::Upstream(format!(
                 "Paperless API v10 is required; server selected v{api_version}"
             )));
         }
-        if !server_version.starts_with('3') {
-            return Err(AppError::Upstream(format!(
-                "Paperless-ngx v3 is required; server reported {server_version}"
-            )));
+        let (major_version, server_version) = validated_server_version(raw_server_version)
+            .ok_or_else(|| {
+                AppError::Upstream(
+                    "Paperless-ngx v3 is required; server did not report a valid version"
+                        .to_owned(),
+                )
+            })?;
+        if major_version != 3 {
+            return Err(AppError::Upstream(
+                "Paperless-ngx v3 is required; connected server is not v3".to_owned(),
+            ));
         }
         let page: Paginated<Value> = response.json().await.map_err(map_transport_error)?;
         Ok(ConnectionProbe {
@@ -269,7 +382,7 @@ impl PaperlessClient {
         decode_success(response).await
     }
 
-    pub async fn list_documents(&self, query: &DocumentQuery) -> AppResult<Vec<PaperlessDocument>> {
+    pub fn document_pages(&self, query: &DocumentQuery) -> AppResult<DocumentPages<'_>> {
         for id in query.trigger_tag_ids.iter().copied() {
             if id <= 0 {
                 return Err(AppError::Validation(
@@ -284,12 +397,9 @@ impl PaperlessClient {
         }
 
         let mut params = vec![
-            (
-                "fields".to_owned(),
-                "id,title,content,tags,correspondent,document_type,custom_fields,modified,added,page_count,mime_type,original_file_name,archived_file_name,versions".to_owned(),
-            ),
+            ("fields".to_owned(), "id,title,versions".to_owned()),
             ("ordering".to_owned(), "added,id".to_owned()),
-            ("page_size".to_owned(), query.limit.clamp(1, 1000).to_string()),
+            ("page_size".to_owned(), query.limit.page_size().to_string()),
         ];
         if !query.trigger_tag_ids.is_empty() {
             let value = query
@@ -314,9 +424,16 @@ impl PaperlessClient {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        let mut documents: Vec<PaperlessDocument> = self.list_all("documents/", &borrowed).await?;
-        documents.truncate(query.limit);
-        Ok(documents)
+        let endpoint = "documents/";
+        let mut url = self.api_url(endpoint)?;
+        url.query_pairs_mut().extend_pairs(borrowed);
+        Ok(DocumentPages {
+            client: self,
+            endpoint,
+            next_url: Some(url),
+            visited: HashSet::new(),
+            remaining: query.limit.max_results(),
+        })
     }
 
     pub async fn patch_document(
@@ -436,13 +553,33 @@ impl PaperlessClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> AppResult<Vec<T>> {
+        self.list_up_to(endpoint, params, None).await
+    }
+
+    async fn list_up_to<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        max_results: Option<usize>,
+    ) -> AppResult<Vec<T>> {
         let mut url = self.api_url(endpoint)?;
-        url.query_pairs_mut()
-            .append_pair("page_size", "1000")
-            .extend_pairs(params.iter().copied());
+        let has_page_size = params.iter().any(|(key, _)| *key == "page_size");
+        {
+            let mut query = url.query_pairs_mut();
+            if !has_page_size {
+                query.append_pair("page_size", "1000");
+            }
+            query.extend_pairs(params.iter().copied());
+        }
         let mut results = Vec::new();
+        let mut visited = HashSet::new();
         loop {
             self.ensure_same_origin(&url)?;
+            if !visited.insert(url.to_string()) {
+                return Err(AppError::Upstream(
+                    "Paperless pagination repeated a page".to_owned(),
+                ));
+            }
             let response = self
                 .request(Method::GET, url.clone())
                 .send()
@@ -450,12 +587,56 @@ impl PaperlessClient {
                 .map_err(map_transport_error)?;
             let page: Paginated<T> = decode_success(response).await?;
             results.extend(page.results);
+            if let Some(limit) = max_results
+                && results.len() >= limit
+            {
+                results.truncate(limit);
+                break;
+            }
             let Some(next) = page.next else {
                 break;
             };
-            url = Url::parse(&next)?;
+            url = self.pagination_url(&url, endpoint, &next)?;
         }
         Ok(results)
+    }
+
+    /// Interprets Paperless's pagination link without ever sending credentials
+    /// to the authority advertised by that link. Django REST Framework builds
+    /// absolute links from proxy headers, which can legitimately describe an
+    /// internal scheme, port, host, or URL prefix instead of the address the
+    /// user configured. Only a matching Paperless API endpoint and its query
+    /// are accepted; the request is always rebased onto the current URL.
+    fn pagination_url(&self, current: &Url, endpoint: &str, next: &str) -> AppResult<Url> {
+        let advertised = current.join(next).map_err(|_| {
+            AppError::Upstream("Paperless returned an invalid pagination URL".to_owned())
+        })?;
+        if !matches!(advertised.scheme(), "http" | "https")
+            || !advertised.username().is_empty()
+            || advertised.password().is_some()
+            || advertised.fragment().is_some()
+            || !pagination_path_matches_endpoint(advertised.path(), endpoint)
+        {
+            return Err(AppError::Upstream(
+                "Paperless returned an unsafe pagination URL".to_owned(),
+            ));
+        }
+        let Some(query) = advertised.query() else {
+            return Err(AppError::Upstream(
+                "Paperless returned a pagination URL without a page query".to_owned(),
+            ));
+        };
+
+        let mut rebased = current.clone();
+        rebased.set_query(Some(query));
+        rebased.set_fragment(None);
+        self.ensure_same_origin(&rebased)?;
+        if rebased == *current {
+            return Err(AppError::Upstream(
+                "Paperless pagination did not advance".to_owned(),
+            ));
+        }
+        Ok(rebased)
     }
 
     fn request(&self, method: Method, url: Url) -> reqwest::RequestBuilder {
@@ -480,6 +661,21 @@ impl PaperlessClient {
         }
         Ok(())
     }
+}
+
+fn pagination_path_matches_endpoint(path: &str, endpoint: &str) -> bool {
+    let path_segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let endpoint_segments = endpoint
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let suffix_length = endpoint_segments.len() + 1;
+    path_segments.len() >= suffix_length
+        && path_segments[path_segments.len() - suffix_length] == "api"
+        && path_segments[path_segments.len() - endpoint_segments.len()..] == endpoint_segments
 }
 
 pub fn merge_tags(existing: &[i64], additions: &[i64], overwrite: bool) -> Vec<i64> {
@@ -589,8 +785,6 @@ async fn ensure_success(response: Response) -> AppResult<Response> {
         return Ok(response);
     }
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    let message = body.chars().take(MAX_ERROR_CHARS).collect::<String>();
     match status.as_u16() {
         401 => Err(AppError::Upstream(
             "Paperless authentication failed".to_owned(),
@@ -606,9 +800,40 @@ async fn ensure_success(response: Response) -> AppResult<Response> {
             "Paperless rate limit reached".to_owned(),
         )),
         _ => Err(AppError::Upstream(format!(
-            "Paperless returned {status}: {message}"
+            "Paperless returned HTTP {}",
+            status.as_u16()
         ))),
     }
+}
+
+fn validated_server_version(raw: &str) -> Option<(u32, String)> {
+    // Only numeric components are ever retained or returned. A legitimate
+    // pre-release/build suffix is unnecessary for the compatibility check and
+    // could otherwise become a channel for arbitrary upstream text.
+    let numeric_prefix = raw
+        .trim()
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>();
+    let components = numeric_prefix.split('.').collect::<Vec<_>>();
+    if components.is_empty()
+        || components.len() > 4
+        || components.iter().any(|component| component.is_empty())
+    {
+        return None;
+    }
+    let components = components
+        .into_iter()
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let major = *components.first()?;
+    let safe_version = components
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    Some((major, safe_version))
 }
 
 fn map_transport_error(error: reqwest::Error) -> AppError {
@@ -676,6 +901,27 @@ mod tests {
             client
                 .ensure_same_origin(&Url::parse("https://evil.example/api/").unwrap())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn server_versions_retain_only_numeric_compatibility_components() {
+        assert_eq!(
+            validated_server_version("3.1.0-private-upstream-text"),
+            Some((3, "3.1.0".to_owned()))
+        );
+        assert_eq!(validated_server_version("30.0.0").unwrap().0, 30);
+        assert!(validated_server_version("PROMPT_PRIVATE sk-secret").is_none());
+        assert!(validated_server_version("3..1").is_none());
+    }
+
+    #[test]
+    fn persisted_document_limits_distinguish_all_from_explicit_caps() {
+        assert_eq!(DocumentLimit::from_persisted(0), DocumentLimit::All);
+        assert_eq!(DocumentLimit::from_persisted(-1), DocumentLimit::All);
+        assert_eq!(
+            DocumentLimit::from_persisted(50),
+            DocumentLimit::UpTo(NonZeroUsize::new(50).unwrap())
         );
     }
 

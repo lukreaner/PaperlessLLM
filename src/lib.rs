@@ -3,6 +3,7 @@ pub mod app;
 pub mod auth;
 pub mod budget;
 pub mod db;
+pub mod diagnostics;
 pub mod error;
 pub mod launcher;
 pub mod models;

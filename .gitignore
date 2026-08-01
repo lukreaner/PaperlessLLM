@@ -5,12 +5,58 @@
 /web/playwright-report/
 /web/blob-report/
 !/web/dist/.gitkeep
-/.env
-/.env.*
-!.env.example
-*.db
-*.db-shm
-*.db-wal
-*.log
+
+# Environment-provided credentials, at any directory depth.
+.[Ee][Nn][Vv]
+.[Ee][Nn][Vv].*
+*.[Ee][Nn][Vv]
+*.[Ee][Nn][Vv].*
+.[Ee][Nn][Vv][Rr][Cc]
+.[Dd][Ii][Rr][Ee][Nn][Vv]/
+!*.[Ee][Nn][Vv].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
+!*.[Ee][Nn][Vv].[Ss][Aa][Mm][Pp][Ll][Ee]
+!*.[Ee][Nn][Vv].[Tt][Ee][Mm][Pp][Ll][Aa][Tt][Ee]
+
+# Private keys and credential containers must never be tracked.
+*.[Kk][Ee][Yy]
+*.[Pp][Ee][Mm]
+*.[Pp]12
+*.[Pp][Ff][Xx]
+
+# Databases and logs may contain private document metadata or encrypted
+# credentials. SQLite can use several sidecar suffixes depending on mode.
+*.[Dd][Bb]
+*.[Dd][Bb]-*
+*.[Dd][Bb].*
+*.[Ss][Qq][Ll][Ii][Tt][Ee]
+*.[Ss][Qq][Ll][Ii][Tt][Ee]-*
+*.[Ss][Qq][Ll][Ii][Tt][Ee]3
+*.[Ss][Qq][Ll][Ii][Tt][Ee]3-*
+*.[Ll][Oo][Gg]
+*.[Ll][Oo][Gg].*
+[Gg][Ii][Tt][Ll][Ee][Aa][Kk][Ss]-[Rr][Ee][Pp][Oo][Rr][Tt].*
+[Gg][Ii][Tt][Ll][Ee][Aa][Kk][Ss]-[Rr][Ee][Ss][Uu][Ll][Tt][Ss].*
+*.[Ss][Aa][Rr][Ii][Ff]
+
+# PaperlessLLM runtime state for any custom --data-dir location.
+.[Mm][Aa][Ss][Tt][Ee][Rr]-[Kk][Ee][Yy]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm].[Ll][Oo][Cc][Kk]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm].[Ii][Nn][Ss][Tt][Aa][Nn][Cc][Ee]
+.[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm].[Ii][Nn][Ss][Tt][Aa][Nn][Cc][Ee].*.[Tt][Mm][Pp]
+.[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm]/
+
+# Credential-bearing local data backups. Release archives do not match these
+# timestamp/backup-specific names.
+*.[Bb][Aa][Kk]
+*.[Bb][Aa][Cc][Kk][Uu][Pp]
+*.[Dd][Uu][Mm][Pp]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm]-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].[Tt][Aa][Rr].[Gg][Zz]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp]*.[Tt][Aa][Rr].[Gg][Zz]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp]*.[Tt][Gg][Zz]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp]*.[Zz][Ii][Pp]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss][Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp]*.[Tt][Aa][Rr].[Gg][Zz]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss][Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp]*.[Tt][Gg][Zz]
+[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss][Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp]*.[Zz][Ii][Pp]
+.[Pp][Aa][Pp][Ee][Rr][Ll][Ee][Ss][Ss]-[Ll][Ll][Mm]-[Bb][Aa][Cc][Kk][Uu][Pp][Ss]/
+
 .DS_Store
-.paperless-llm/

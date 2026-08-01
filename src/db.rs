@@ -18,6 +18,7 @@ impl Database {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        prepare_private_database_file(path)?;
 
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
@@ -35,6 +36,7 @@ impl Database {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
         sqlx::query("PRAGMA optimize").execute(&pool).await?;
+        harden_sqlite_file_permissions(path)?;
 
         Ok(Self { pool })
     }
@@ -80,5 +82,84 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn prepare_private_database_file(path: &Path) -> AppResult<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // Creating the database ourselves applies a private mode from its first
+    // inode. Re-applying it also repairs databases created by older releases.
+    let _file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_private_database_file(_path: &Path) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_sqlite_file_permissions(path: &Path) -> AppResult<()> {
+    use std::{ffi::OsString, os::unix::fs::PermissionsExt, path::PathBuf};
+
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate: OsString = path.as_os_str().to_owned();
+        candidate.push(suffix);
+        let candidate = PathBuf::from(candidate);
+        match std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_sqlite_file_permissions(_path: &Path) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::Database;
+
+    #[tokio::test]
+    async fn connect_repairs_database_and_sidecar_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("paperless-llm.db");
+        std::fs::write(&path, []).expect("create database placeholder");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make database deliberately too broad");
+
+        let database = Database::connect(&path).await.expect("database");
+
+        for candidate in [
+            path.clone(),
+            path.with_file_name("paperless-llm.db-wal"),
+            path.with_file_name("paperless-llm.db-shm"),
+        ] {
+            if candidate.exists() {
+                let mode = std::fs::metadata(&candidate)
+                    .expect("database metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "{} was not private", candidate.display());
+            }
+        }
+
+        database.pool().close().await;
     }
 }

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     AppError, AppResult,
     api::{
-        settings::load_settings,
+        settings::{ACTIVE_PROVIDER_SETTING_KEY, load_settings},
         types::{ModelsResponse, ProviderCapabilitiesDto, ProviderProfileDto, ProviderTestResult},
     },
     app::AppState,
@@ -177,6 +177,10 @@ async fn save(
         state
             .database
             .set_setting("dashboard_settings", &settings)
+            .await?;
+        state
+            .database
+            .set_setting(ACTIVE_PROVIDER_SETTING_KEY, &settings.active_provider_id)
             .await?;
     }
     // A saved health result only describes the exact endpoint/model/options

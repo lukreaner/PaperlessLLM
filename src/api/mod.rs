@@ -1,3 +1,4 @@
+mod logs;
 pub mod providers;
 pub mod settings;
 pub mod types;
@@ -17,7 +18,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, QueryBuilder, Sqlite};
-use url::Url;
+use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -25,9 +26,10 @@ use crate::{
     api::{
         settings::{cache_catalogs, load_connection, load_settings, save_settings},
         types::{
-            AppSettings, AppStatus, ApproveRequest, AuthStatus, BootstrapResponse, CatalogItem,
-            Catalogs, ConnectionHealth, LoginRequest, OkResponse, PaperlessTestRequest,
-            PaperlessTestResult, PasswordRequest, ProviderProfileDto, WorkerStatusDto,
+            ActiveJobDto, AppSettings, AppStatus, ApproveRequest, AuthStatus, BootstrapResponse,
+            CatalogItem, Catalogs, ConnectionHealth, LoginRequest, OkResponse,
+            PaperlessTestRequest, PaperlessTestResult, PasswordRequest, ProviderProfileDto,
+            ScanProgressDto, WorkerStatusDto,
         },
     },
     app::AppState,
@@ -38,6 +40,9 @@ use crate::{
 };
 
 const SESSION_COOKIE: &str = "paperlessllm_session";
+const DESKTOP_ACTION_HEADER: &str = "x-paperlessllm-action";
+const SHUTDOWN_ACTION: &str = "shutdown";
+const WORKER_CONTROL_ACTION: &str = "worker-control";
 
 pub fn router(state: AppState) -> Router<AppState> {
     let protected = Router::new()
@@ -59,18 +64,34 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/providers/{id}/models", get(provider_models))
         .route("/api/providers/{id}/test", post(test_provider))
         .route("/api/scan", post(scan_now))
+        .route("/api/worker", get(worker_status))
+        .route("/api/worker/pause", post(pause_worker))
+        .route("/api/worker/resume", post(resume_worker))
+        .route("/api/shutdown", post(shutdown))
+        .route("/api/logs", get(logs::tail))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}/retry", post(retry_job))
+        .route("/api/jobs/{id}/cancel", post(cancel_job))
         .route("/api/reviews", get(list_reviews))
         .route("/api/reviews/{id}/approve", post(approve_review))
         .route("/api/reviews/{id}/reject", post(reject_review))
         .route("/api/stats/summary", get(stats_summary))
         .route("/api/stats/series", get(stats_series))
-        .layer(middleware::from_fn_with_state(state, security_guard));
+        .layer(middleware::from_fn_with_state(state, security_guard))
+        .layer(middleware::from_fn(private_api_response));
 
     Router::new()
         .route("/healthz", get(healthz))
         .merge(protected)
+}
+
+async fn private_api_response(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    response
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<Value> {
@@ -88,6 +109,7 @@ async fn security_guard(
     next: Next,
 ) -> AppResult<Response> {
     if !state.requires_auth() {
+        validate_local_request(&state, &request)?;
         return Ok(next.run(request).await);
     }
     let path = request.uri().path().to_owned();
@@ -117,6 +139,109 @@ async fn security_guard(
         }
     }
     Ok(next.run(request).await)
+}
+
+fn validate_local_request(state: &AppState, request: &Request) -> AppResult<()> {
+    validate_local_request_authority(state, request)?;
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        validate_local_origin(state, request.headers())?;
+    }
+    Ok(())
+}
+
+fn validate_local_request_authority(state: &AppState, request: &Request) -> AppResult<()> {
+    let mut host_values = request.headers().get_all(header::HOST).iter();
+    let host = host_values.next();
+    if host_values.next().is_some() {
+        return Err(AppError::Forbidden(
+            "request has an invalid Host authority".to_owned(),
+        ));
+    }
+
+    let uri_authority = request.uri().authority();
+    if host.is_none() && uri_authority.is_none() {
+        return Err(AppError::Forbidden(
+            "request is missing its Host authority".to_owned(),
+        ));
+    }
+
+    if let Some(host) = host {
+        let host = host.to_str().ok();
+        if !host.is_some_and(|host| is_local_authority(state, host)) {
+            return Err(AppError::Forbidden(
+                "request Host is not the local dashboard".to_owned(),
+            ));
+        }
+    }
+
+    if let Some(authority) = uri_authority {
+        let http_scheme = request
+            .uri()
+            .scheme_str()
+            .is_none_or(|scheme| scheme.eq_ignore_ascii_case("http"));
+        if !http_scheme || !is_local_authority(state, authority.as_str()) {
+            return Err(AppError::Forbidden(
+                "request authority is not the local dashboard".to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_local_authority(state: &AppState, authority: &str) -> bool {
+    if authority.is_empty() || authority.trim() != authority {
+        return false;
+    }
+    Url::parse(&format!("http://{authority}"))
+        .ok()
+        .is_some_and(|url| is_local_dashboard_url(state, &url))
+}
+
+fn validate_local_origin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    let mut values = headers.get_all(header::ORIGIN).iter();
+    let Some(value) = values.next() else {
+        // Non-browser clients do not normally send Origin. They still need a
+        // trusted local Host authority, plus any endpoint-specific action
+        // confirmation header.
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(AppError::Forbidden(
+            "request has an invalid Origin".to_owned(),
+        ));
+    }
+
+    let origin = value.to_str().ok().and_then(|value| Url::parse(value).ok());
+    if !origin
+        .as_ref()
+        .is_some_and(|origin| is_local_dashboard_url(state, origin))
+    {
+        return Err(AppError::Forbidden(
+            "request Origin is not the local dashboard".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_local_dashboard_url(state: &AppState, url: &Url) -> bool {
+    let loopback_host = match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    url.scheme() == "http"
+        && loopback_host
+        && url.port_or_known_default() == Some(state.listening_port())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -206,6 +331,47 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<
     Ok(response)
 }
 
+async fn shutdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<(StatusCode, Json<OkResponse>)> {
+    // Localhost normally uses the operating-system account as its trust
+    // boundary and does not need a session. Shutdown is different: requiring
+    // a non-simple, exact-value header ensures that an unrelated web page
+    // cannot submit the action as a cross-site form or simple CORS request.
+    // LAN mode additionally passes through the session and CSRF guard above.
+    let action = headers
+        .get(DESKTOP_ACTION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if action != Some(SHUTDOWN_ACTION) {
+        return Err(AppError::Forbidden(
+            "missing or invalid shutdown confirmation header".to_owned(),
+        ));
+    }
+    validate_local_shutdown_origin(&state, &headers)?;
+
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        // Let the handler hand its response back to Axum before notifying the
+        // server. Graceful shutdown then drains this request before exiting.
+        tokio::task::yield_now().await;
+        shutdown.request();
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(OkResponse { ok: true })))
+}
+
+fn validate_local_shutdown_origin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    // A LAN deployment can legitimately be served from an arbitrary HTTPS
+    // reverse-proxy origin. Its authenticated session and CSRF token are the
+    // protection boundary, so the direct-listener origin rule applies only to
+    // the sessionless localhost mode.
+    if state.requires_auth() {
+        return Ok(());
+    }
+    validate_local_origin(state, headers)
+}
+
 async fn set_password(
     State(state): State<AppState>,
     Json(input): Json<PasswordRequest>,
@@ -227,16 +393,19 @@ async fn status(
 }
 
 async fn build_status(state: &AppState, session: Option<SessionInfo>) -> AppResult<AppStatus> {
-    let configured = state.database.is_configured().await?;
-    let worker = state.worker.runtime_state().await;
+    let (configuration, worker, queue, auth) = tokio::try_join!(
+        status_configuration(state),
+        build_worker_status(state),
+        worker::queue_counts(state),
+        auth_status_value(state, session),
+    )?;
     let paperless = connection_health(
         state,
         "paperless_health",
-        load_connection(state).await?.is_some(),
+        configuration.paperless_configured,
     )
     .await?;
-    let settings = load_settings(state).await?;
-    let provider = if let Some(id) = settings.active_provider_id.as_deref() {
+    let provider = if let Some(id) = configuration.active_provider_id.as_deref() {
         connection_health(state, &format!("provider_health:{id}"), true).await?
     } else {
         ConnectionHealth {
@@ -247,18 +416,114 @@ async fn build_status(state: &AppState, session: Option<SessionInfo>) -> AppResu
     };
     Ok(AppStatus {
         version: env!("CARGO_PKG_VERSION"),
-        setup_required: !configured,
-        worker: WorkerStatusDto {
-            state: worker.state,
-            last_scan_at: worker.last_scan_at,
-            next_scan_at: worker.next_scan_at,
-            active_job_id: worker.active_job_id,
-        },
+        setup_required: !configuration.configured,
+        worker,
         paperless,
         provider,
-        queue: worker::queue_counts(state).await?,
-        auth: auth_status_value(state, session).await?,
+        queue,
+        auth,
     })
+}
+
+#[derive(FromRow)]
+struct StatusConfiguration {
+    configured: bool,
+    paperless_configured: bool,
+    active_provider_id: Option<String>,
+}
+
+/// Reads only the small, non-secret values needed by the frequently-polled
+/// status endpoint. In particular, this never materializes AppSettings and
+/// therefore never asks the secret store whether credentials exist.
+async fn status_configuration(state: &AppState) -> AppResult<StatusConfiguration> {
+    Ok(sqlx::query_as(
+        "SELECT \
+            EXISTS(SELECT 1 FROM processing_profiles WHERE enabled=1) AS configured, \
+            EXISTS(SELECT 1 FROM paperless_connections WHERE id=?) AS paperless_configured, \
+            COALESCE( \
+                (SELECT CASE WHEN json_valid(value_json) \
+                    THEN json_extract(value_json, '$') END \
+                 FROM app_settings WHERE key='active_provider_id'), \
+                (SELECT provider_profile_id FROM processing_profiles \
+                 WHERE enabled=1 ORDER BY created_at, id LIMIT 1) \
+            ) AS active_provider_id",
+    )
+    .bind(settings::CONNECTION_ID)
+    .fetch_one(state.database.pool())
+    .await?)
+}
+
+async fn build_worker_status(state: &AppState) -> AppResult<WorkerStatusDto> {
+    let runtime = state.worker.runtime_state().await;
+    let active_job = if let Some(job_id) = runtime.active_job_id.as_deref() {
+        let row: Option<(String, i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, paperless_document_id, COALESCE(document_title,''), status, updated_at \
+             FROM jobs WHERE id=?",
+        )
+        .bind(job_id)
+        .fetch_optional(state.database.pool())
+        .await?;
+        row.map(
+            |(id, document_id, document_title, job_state, updated_at)| ActiveJobDto {
+                id,
+                document_id,
+                document_title,
+                state: job_state,
+                updated_at,
+            },
+        )
+    } else {
+        None
+    };
+
+    Ok(WorkerStatusDto {
+        state: runtime.state,
+        paused: runtime.paused,
+        last_scan_at: runtime.last_scan_at,
+        next_scan_at: runtime.next_scan_at,
+        active_job_id: runtime.active_job_id,
+        active_job,
+        scan_progress: runtime.scan_progress.map(|progress| ScanProgressDto {
+            trigger: progress.trigger,
+            discovered: progress.discovered,
+            queued: progress.queued,
+            started_at: progress.started_at,
+        }),
+    })
+}
+
+async fn worker_status(State(state): State<AppState>) -> AppResult<Json<WorkerStatusDto>> {
+    Ok(Json(build_worker_status(&state).await?))
+}
+
+fn require_worker_control_header(headers: &HeaderMap) -> AppResult<()> {
+    let action = headers
+        .get(DESKTOP_ACTION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if action != Some(WORKER_CONTROL_ACTION) {
+        return Err(AppError::Forbidden(
+            "missing or invalid worker-control confirmation header".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn pause_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<WorkerStatusDto>> {
+    require_worker_control_header(&headers)?;
+    worker::set_paused(&state, true).await?;
+    Ok(Json(build_worker_status(&state).await?))
+}
+
+async fn resume_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<WorkerStatusDto>> {
+    require_worker_control_header(&headers)?;
+    worker::set_paused(&state, false).await?;
+    Ok(Json(build_worker_status(&state).await?))
 }
 
 async fn connection_health(
@@ -373,7 +638,7 @@ async fn test_paperless(
                     &json!({
                         "ok": false,
                         "tested_at": Utc::now().to_rfc3339(),
-                        "message": error.to_string(),
+                        "message": crate::diagnostics::safe_error_summary(&error),
                     }),
                 )
                 .await?;
@@ -529,7 +794,16 @@ async fn test_provider(
 }
 
 async fn scan_now(State(state): State<AppState>) -> AppResult<Json<worker::ScanResult>> {
-    Ok(Json(state.worker.scan_now().await?))
+    match state.worker.scan_now().await {
+        Ok(result) => Ok(Json(result)),
+        Err(error) => {
+            tracing::warn!(
+                error = %crate::diagnostics::safe_error_summary(&error),
+                "manual Paperless scan failed"
+            );
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -666,6 +940,29 @@ async fn retry_job(
 ) -> AppResult<Json<OkResponse>> {
     worker::retry_job(&state, &id).await?;
     Ok(Json(OkResponse { ok: true }))
+}
+
+#[derive(Debug, Serialize)]
+struct CancelJobResponse {
+    ok: bool,
+    job_id: String,
+    state: &'static str,
+    reason: &'static str,
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<Json<CancelJobResponse>> {
+    require_worker_control_header(&headers)?;
+    worker::cancel_waiting_job(&state, &id).await?;
+    Ok(Json(CancelJobResponse {
+        ok: true,
+        job_id: id,
+        state: "rejected",
+        reason: "cancelled_by_user",
+    }))
 }
 
 fn worker_state_valid(value: &str) -> bool {

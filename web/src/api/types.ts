@@ -23,15 +23,35 @@ export interface ConnectionHealth {
   checked_at?: string;
 }
 
+export interface ActiveJob {
+  id: string;
+  document_id: number;
+  document_title: string;
+  state: JobState;
+  updated_at: string;
+}
+
+export interface ScanProgress {
+  trigger: "manual" | "scheduled";
+  discovered: number;
+  queued: number;
+  started_at: string;
+}
+
+export interface WorkerStatus {
+  state: "running" | "scanning" | "pausing" | "paused" | "error";
+  paused: boolean;
+  last_scan_at?: string;
+  next_scan_at?: string;
+  active_job_id?: string;
+  active_job?: ActiveJob;
+  scan_progress?: ScanProgress;
+}
+
 export interface AppStatus {
   version: string;
   setup_required: boolean;
-  worker: {
-    state: "running" | "paused" | "error";
-    last_scan_at?: string;
-    next_scan_at?: string;
-    active_job_id?: string;
-  };
+  worker: WorkerStatus;
   paperless: ConnectionHealth;
   provider: ConnectionHealth;
   queue: Record<JobState, number>;
@@ -127,6 +147,7 @@ export interface OverwriteSettings {
 
 export interface ProcessingSettings {
   poll_interval_minutes: number;
+  max_documents_per_scan: number | null;
   review_mode: boolean;
   use_existing_correspondents_and_tags: boolean;
   process_only_tagged: boolean;
@@ -187,6 +208,32 @@ export interface BootstrapResponse {
   settings: AppSettings;
   providers: ProviderProfile[];
   catalogs?: Catalogs;
+}
+
+export interface DiagnosticLogs {
+  available: boolean;
+  entries: DiagnosticLogEntry[];
+  truncated: boolean;
+  updated_at?: string;
+  message?: string;
+  worker: DiagnosticWorkerSnapshot;
+}
+
+export interface DiagnosticLogEntry {
+  timestamp: string;
+  level: "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR";
+  event: string;
+  target: "service" | "dashboard" | "worker" | "paperless" | "document" | "provider" | "budget" | "api";
+  fields: Record<string, string>;
+}
+
+export interface DiagnosticWorkerSnapshot {
+  state: "running" | "scanning" | "pausing" | "paused" | "error" | "unknown";
+  active: boolean;
+  scan_discovered?: number;
+  scan_queued?: number;
+  last_scan_at?: string;
+  next_scan_at?: string;
 }
 
 export interface PaperlessTestResult {
@@ -303,6 +350,13 @@ export interface ScanResult {
   queued: number;
   skipped: number;
   message?: string;
+}
+
+export interface CancelJobResult {
+  ok: boolean;
+  job_id: string;
+  state: "rejected";
+  reason: "cancelled_by_user";
 }
 
 export interface ApiErrorBody {

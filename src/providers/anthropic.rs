@@ -99,7 +99,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
                 .send()
                 .await
                 .map_err(|error| ProviderError::transport("model listing", error))?;
-            let response = receive_json(response, "model listing", &[&self.api_key]).await?;
+            let response = receive_json(response, "model listing").await?;
             let page = parse_anthropic_model_page(&response.value)?;
             models.extend(page.models);
             let Some(cursor) = page.next_cursor else {
@@ -136,7 +136,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             .send()
             .await
             .map_err(|error| ProviderError::transport("input token count", error))?;
-        let response = receive_json(response, "input token count", &[&self.api_key]).await?;
+        let response = receive_json(response, "input token count").await?;
         let input_tokens = response
             .value
             .get("input_tokens")
@@ -160,7 +160,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             .send()
             .await
             .map_err(|error| ProviderError::transport("analysis", error))?;
-        let response = receive_json(response, "analysis", &[&self.api_key]).await?;
+        let response = receive_json(response, "analysis").await?;
         let mut result =
             parse_messages_result(response.value, response.request_id, &request.schema)?;
         backfill_estimated_usage(&mut result.usage, request, &result.raw_text);

@@ -1,0 +1,9 @@
+version: 2
+
+updates:
+  # Keep immutable workflow-action pins reviewably current. Dependabot updates
+  # both the full commit SHA and the adjacent human-readable version comment.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

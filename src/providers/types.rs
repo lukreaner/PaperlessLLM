@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -269,17 +269,15 @@ pub struct AnalysisResult {
     pub request_id: Option<String>,
 }
 
-#[derive(Debug)]
 pub enum ProviderError {
     Configuration(String),
     Transport {
         operation: &'static str,
-        detail: String,
+        timed_out: bool,
     },
     Remote {
         operation: &'static str,
         status: u16,
-        detail: String,
     },
     InvalidResponse(String),
     /// The provider completed an inference request, but its output did not
@@ -293,32 +291,43 @@ pub enum ProviderError {
     },
 }
 
+impl Debug for ProviderError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(_) => formatter.write_str("ProviderError::Configuration"),
+            Self::Transport {
+                operation,
+                timed_out,
+            } => formatter
+                .debug_struct("ProviderError::Transport")
+                .field("operation", operation)
+                .field("timed_out", timed_out)
+                .finish(),
+            Self::Remote { operation, status } => formatter
+                .debug_struct("ProviderError::Remote")
+                .field("operation", operation)
+                .field("status", status)
+                .finish(),
+            Self::InvalidResponse(_) => formatter.write_str("ProviderError::InvalidResponse"),
+            Self::InvalidStructuredOutput { .. } => {
+                formatter.write_str("ProviderError::InvalidStructuredOutput")
+            }
+        }
+    }
+}
+
 impl ProviderError {
     pub(crate) fn transport(operation: &'static str, error: reqwest::Error) -> Self {
-        // reqwest error URLs can contain credentials or signed query strings.
-        let detail = error.without_url().to_string();
-        Self::Transport { operation, detail }
+        Self::Transport {
+            operation,
+            timed_out: error.is_timeout(),
+        }
     }
 
-    pub(crate) fn remote(
-        operation: &'static str,
-        status: reqwest::StatusCode,
-        body: &str,
-        secrets: &[&str],
-    ) -> Self {
-        let mut detail = extract_remote_message(body);
-        for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-            detail = detail.replace(secret, "[REDACTED]");
-        }
-        detail = redact_bearer_like_tokens(&detail);
-        if detail.len() > 512 {
-            detail.truncate(512);
-            detail.push_str("...");
-        }
+    pub(crate) fn remote(operation: &'static str, status: reqwest::StatusCode) -> Self {
         Self::Remote {
             operation,
             status: status.as_u16(),
-            detail,
         }
     }
 }
@@ -327,62 +336,30 @@ impl Display for ProviderError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration(detail) => write!(formatter, "provider configuration: {detail}"),
-            Self::Transport { operation, detail } => {
-                write!(formatter, "provider {operation} transport error: {detail}")
-            }
-            Self::Remote {
+            Self::Transport {
                 operation,
-                status,
-                detail,
-            } => write!(
-                formatter,
-                "provider {operation} failed with HTTP {status}: {detail}"
-            ),
-            Self::InvalidResponse(detail) => {
-                write!(formatter, "provider returned an invalid response: {detail}")
+                timed_out,
+            } => {
+                if *timed_out {
+                    write!(formatter, "provider {operation} timed out")
+                } else {
+                    write!(formatter, "provider {operation} request failed")
+                }
             }
-            Self::InvalidStructuredOutput { detail, .. } => {
-                write!(
-                    formatter,
-                    "provider returned invalid structured output: {detail}"
-                )
+            Self::Remote { operation, status } => {
+                write!(formatter, "provider {operation} failed with HTTP {status}")
+            }
+            Self::InvalidResponse(_) => {
+                write!(formatter, "provider returned an invalid response")
+            }
+            Self::InvalidStructuredOutput { .. } => {
+                write!(formatter, "provider returned invalid structured output")
             }
         }
     }
 }
 
 impl Error for ProviderError {}
-
-fn extract_remote_message(body: &str) -> String {
-    let parsed = serde_json::from_str::<Value>(body).ok();
-    parsed
-        .as_ref()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .or_else(|| value.get("message"))
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("request rejected by provider")
-        .to_owned()
-}
-
-fn redact_bearer_like_tokens(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|word| {
-            let trimmed = word.trim_matches(|character: char| {
-                matches!(character, ',' | '.' | ':' | ';' | '"' | '\'' | '(' | ')')
-            });
-            if trimmed.starts_with("sk-") || trimmed.starts_with("Bearer_") {
-                word.replace(trimmed, "[REDACTED]")
-            } else {
-                word.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 pub(crate) fn prompt_with_json_fallback(request: &AnalysisRequest) -> String {
     let schema = serde_json::to_string(&request.schema).unwrap_or_else(|_| "{}".to_owned());
@@ -642,17 +619,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_errors_redact_known_and_bearer_like_secrets() {
-        let secret = "sk-test-secret";
-        let error = ProviderError::remote(
-            "analysis",
-            reqwest::StatusCode::BAD_REQUEST,
-            &format!(r#"{{"error":{{"message":"bad key {secret}"}}}}"#),
-            &[secret],
-        );
+    fn remote_errors_never_retain_or_render_response_messages() {
+        let error = ProviderError::remote("analysis", reqwest::StatusCode::BAD_REQUEST);
         let rendered = error.to_string();
-        assert!(!rendered.contains(secret));
-        assert!(rendered.contains("[REDACTED]"));
+        assert_eq!(rendered, "provider analysis failed with HTTP 400");
+        assert!(!rendered.contains("error"));
     }
 
     #[test]

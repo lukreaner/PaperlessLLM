@@ -134,12 +134,6 @@ impl OpenAiCompatibleAdapter {
         }
         request
     }
-
-    fn secrets(&self) -> Vec<&str> {
-        let mut secrets = self.api_key.as_deref().into_iter().collect::<Vec<_>>();
-        secrets.extend(self.headers.values().map(String::as_str));
-        secrets
-    }
 }
 
 #[async_trait]
@@ -166,7 +160,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             .send()
             .await
             .map_err(|error| ProviderError::transport("model listing", error))?;
-        let response = receive_json(response, "model listing", &self.secrets()).await?;
+        let response = receive_json(response, "model listing").await?;
         parse_openai_models(&response.value)
     }
 
@@ -190,7 +184,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             .send()
             .await
             .map_err(|error| ProviderError::transport("input token count", error))?;
-        let response = receive_json(response, "input token count", &self.secrets()).await?;
+        let response = receive_json(response, "input token count").await?;
         let input_tokens = response
             .value
             .get("input_tokens")
@@ -229,7 +223,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             .send()
             .await
             .map_err(|error| ProviderError::transport("analysis", error))?;
-        let response = receive_json(response, "analysis", &self.secrets()).await?;
+        let response = receive_json(response, "analysis").await?;
         let mut result = match self.transport {
             CompatibleTransport::Responses => {
                 parse_responses_result(response.value, response.request_id, &request.schema)

@@ -10,17 +10,24 @@ const navItems = [
   { path: "/review", label: "Review", mark: "✓" },
   { path: "/activity", label: "Activity", mark: "↻" },
   { path: "/statistics", label: "Statistics", mark: "▥" },
+  { path: "/logs", label: "Logs", mark: "≡" },
   { path: "/settings", label: "Settings", mark: "⚙" },
 ];
 
 function connectionTone(state: string): "success" | "warning" | "danger" | "neutral" {
-  if (state === "connected" || state === "running") return "success";
-  if (state === "degraded" || state === "paused") return "warning";
+  if (state === "connected" || state === "running" || state === "scanning") return "success";
+  if (state === "degraded" || state === "paused" || state === "pausing") return "warning";
   if (state === "disconnected" || state === "error") return "danger";
   return "neutral";
 }
 
-export function Layout({ children, status, onRefreshStatus, onLogout }: { children: ReactNode; status?: AppStatus; onRefreshStatus: () => void; onLogout: () => void }) {
+export function Layout({ children, status, onRefreshStatus, onLogout, onQuit }: {
+  children: ReactNode;
+  status?: AppStatus;
+  onRefreshStatus: () => void;
+  onLogout: () => void;
+  onQuit: () => void;
+}) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const location = useLocation();
   useEffect(() => setMobileOpen(false), [location.pathname]);
@@ -53,6 +60,10 @@ export function Layout({ children, status, onRefreshStatus, onLogout }: { childr
             <Badge tone="neutral">v{status?.version ?? "—"}</Badge>
           </div>
           {status?.auth.required && <button className="sidebar-logout" onClick={onLogout}>Sign out</button>}
+          <button className="sidebar-quit" onClick={onQuit}>
+            <span aria-hidden="true">⏻</span>
+            Quit PaperlessLLM
+          </button>
         </div>
       </aside>
       {mobileOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMobileOpen(false)} />}

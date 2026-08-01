@@ -127,12 +127,6 @@ impl AuthService {
         let expires_at = DateTime::parse_from_rfc3339(&expires_at)
             .map_err(|_| AppError::Internal("stored session expiry is invalid".to_owned()))?
             .with_timezone(&Utc);
-        sqlx::query(
-            "UPDATE sessions SET last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id_hash=?",
-        )
-        .bind(&id_hash)
-        .execute(self.database.pool())
-        .await?;
         Ok(Some(SessionInfo {
             id_hash,
             csrf_token,

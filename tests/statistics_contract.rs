@@ -1,6 +1,9 @@
 use std::{net::IpAddr, path::Path};
 
-use axum::{body::Body, http::Request};
+use axum::{
+    body::Body,
+    http::{Request, header},
+};
 use http_body_util::BodyExt;
 use paperless_llm::{
     RuntimeOptions,
@@ -14,14 +17,20 @@ fn runtime(path: &Path) -> RuntimeOptions {
     RuntimeOptions {
         data_dir: path.to_owned(),
         bind: IpAddr::from([127, 0, 0, 1]),
-        port: 0,
+        port: 8765,
         open_browser: false,
     }
 }
 
 async fn response_json(app: axum::Router, uri: &str) -> Value {
     let response = app
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(header::HOST, "localhost:8765")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("statistics response");
     assert!(response.status().is_success());

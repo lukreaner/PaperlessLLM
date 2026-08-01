@@ -1,5 +1,4 @@
 use std::{
-    fs::{File, OpenOptions},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -11,6 +10,7 @@ use tokio::time::sleep;
 use crate::{
     AppError, AppResult, RuntimeOptions,
     app::{ensure_private_data_dir, instance_fingerprint, open_browser_now},
+    diagnostics::validate_desktop_log_paths,
 };
 
 const STARTUP_ATTEMPTS: usize = 200;
@@ -54,7 +54,8 @@ pub async fn launch(mut options: RuntimeOptions) -> AppResult<()> {
     }
 
     let log_path = options.data_dir.join("paperless-llm.log");
-    let mut child = spawn_service(&options, &log_path)?;
+    validate_desktop_log_paths(&options.data_dir)?;
+    let mut child = spawn_service(&options)?;
     for _ in 0..STARTUP_ATTEMPTS {
         match service_health(&client, &dashboard_url, &instance_id).await {
             ServiceHealth::Matching => {
@@ -163,9 +164,8 @@ async fn service_health(
     }
 }
 
-fn spawn_service(options: &RuntimeOptions, log_path: &std::path::Path) -> AppResult<Child> {
+fn spawn_service(options: &RuntimeOptions) -> AppResult<Child> {
     let executable = std::env::current_exe()?;
-    let (stdout, stderr) = private_log_files(log_path)?;
     let mut command = Command::new(executable);
     command
         .arg("serve")
@@ -176,34 +176,19 @@ fn spawn_service(options: &RuntimeOptions, log_path: &std::path::Path) -> AppRes
         .arg("--port")
         .arg(options.port.to_string())
         .arg("--no-open")
+        .arg("--desktop-log")
         .current_dir(&options.data_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        // The child owns its bounded diagnostic writer. Inheriting a raw log
+        // descriptor here would keep writing to an old inode after rotation.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     command.spawn().map_err(AppError::from)
-}
-
-fn private_log_files(path: &std::path::Path) -> AppResult<(File, File)> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = OpenOptions::new();
-    options.create(true).append(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let stdout = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    let stderr = stdout.try_clone()?;
-    Ok((stdout, stderr))
 }
 
 /// Show a visible startup error when launch mode was entered from Finder or a

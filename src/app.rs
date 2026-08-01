@@ -5,14 +5,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
 
-use axum::{Router, http::header};
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, header},
+};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -20,7 +24,7 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -72,9 +76,31 @@ pub struct AppState {
     pub runtime: Arc<RuntimeOptions>,
     pub worker: WorkerHandle,
     pub instance_id: Arc<str>,
+    pub(crate) shutdown: ShutdownHandle,
+    listening_port: Arc<AtomicU16>,
     lan_auth_required: Arc<AtomicBool>,
     // Holding this descriptor keeps the single-process data-directory lock alive.
     _data_lock: Arc<File>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ShutdownHandle {
+    requested: watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    fn new() -> Self {
+        let (requested, _) = watch::channel(false);
+        Self { requested }
+    }
+
+    pub(crate) fn request(&self) {
+        self.requested.send_replace(true);
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.requested.subscribe()
+    }
 }
 
 impl AppState {
@@ -90,6 +116,14 @@ impl AppState {
         self.lan_auth_required
             .store(self.runtime.is_lan_mode() || enabled, Ordering::Release);
     }
+
+    pub(crate) fn listening_port(&self) -> u16 {
+        self.listening_port.load(Ordering::Acquire)
+    }
+
+    fn set_listening_port(&self, port: u16) {
+        self.listening_port.store(port, Ordering::Release);
+    }
 }
 
 pub async fn initialize(options: RuntimeOptions) -> AppResult<AppState> {
@@ -101,7 +135,11 @@ pub async fn initialize(options: RuntimeOptions) -> AppResult<AppState> {
     let secrets = SecretStore::new(database.clone(), &options.data_dir).await?;
     let auth = AuthService::new(database.clone());
     let budget = BudgetService::new(database.clone());
-    let (worker_handle, receiver) = worker::channel();
+    let worker_paused = database
+        .get_setting::<bool>(worker::PAUSED_SETTING_KEY)
+        .await?
+        .unwrap_or(false);
+    let (worker_handle, receiver) = worker::channel(worker_paused);
     let configured_lan = database
         .get_setting::<serde_json::Value>("dashboard_settings")
         .await?
@@ -113,6 +151,7 @@ pub async fn initialize(options: RuntimeOptions) -> AppResult<AppState> {
         .unwrap_or(false);
     let lan_auth_required = options.is_lan_mode() || configured_lan;
 
+    let configured_port = options.port;
     let state = AppState {
         database,
         secrets,
@@ -121,6 +160,8 @@ pub async fn initialize(options: RuntimeOptions) -> AppResult<AppState> {
         runtime: Arc::new(options),
         worker: worker_handle,
         instance_id: Arc::from(instance_id),
+        shutdown: ShutdownHandle::new(),
+        listening_port: Arc::new(AtomicU16::new(configured_port)),
         lan_auth_required: Arc::new(AtomicBool::new(lan_auth_required)),
         _data_lock: Arc::new(data_lock),
     };
@@ -134,6 +175,7 @@ pub async fn initialize(options: RuntimeOptions) -> AppResult<AppState> {
             "charged interrupted AI reservations during startup recovery"
         );
     }
+    worker::recover_interrupted_jobs(&state).await?;
 
     if state.requires_auth() && !state.auth.has_admin_password().await? {
         return Err(AppError::Validation(
@@ -169,7 +211,15 @@ pub fn build_router(state: AppState) -> Router {
             header::HeaderName::from_static("x-request-id"),
             MakeRequestUuid,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+                info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request_log_path(request)
+                )
+            }),
+        )
         .layer(CatchPanicLayer::new())
         .with_state(state)
 }
@@ -179,6 +229,8 @@ pub async fn run(options: RuntimeOptions) -> AppResult<()> {
     let address = state.runtime.socket_addr();
     let listener = TcpListener::bind(address).await?;
     let local_address = listener.local_addr()?;
+    state.set_listening_port(local_address.port());
+    let shutdown = state.shutdown.subscribe();
     let browser_url = if state.runtime.port == 0 {
         let mut options = (*state.runtime).clone();
         options.port = local_address.port();
@@ -186,11 +238,14 @@ pub async fn run(options: RuntimeOptions) -> AppResult<()> {
     } else {
         state.runtime.browser_url()
     };
-    info!(%local_address, data_dir = %state.runtime.data_dir.display(), "PaperlessLLM is ready");
+    info!(%local_address, "PaperlessLLM is ready");
     if state.runtime.open_browser {
         tokio::spawn(async move {
             if let Err(error) = open_browser_now(&browser_url).await {
-                warn!(%error, "could not open the dashboard in a browser");
+                warn!(
+                    error = %crate::diagnostics::safe_error_summary(&error),
+                    "could not open the dashboard in a browser"
+                );
             }
         });
     }
@@ -199,10 +254,14 @@ pub async fn run(options: RuntimeOptions) -> AppResult<()> {
         listener,
         build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(shutdown))
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?;
     Ok(())
+}
+
+fn request_log_path<B>(request: &Request<B>) -> &'static str {
+    crate::diagnostics::safe_request_path(request.uri().path()).unwrap_or("/dashboard")
 }
 
 pub(crate) async fn ensure_private_data_dir(path: &Path) -> AppResult<()> {
@@ -320,7 +379,8 @@ fn acquire_data_lock(data_dir: &Path) -> AppResult<File> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path)?;
+        .open(&path)?;
+    set_private_file_permissions(&path)?;
     file.try_lock_exclusive().map_err(|_| {
         AppError::Conflict(
             "another PaperlessLLM process is already using this data directory".to_owned(),
@@ -370,7 +430,7 @@ pub(crate) async fn open_browser_now(url: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(mut dashboard_shutdown: watch::Receiver<bool>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -384,10 +444,21 @@ async fn shutdown_signal() {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+    let dashboard = async move {
+        if *dashboard_shutdown.borrow() {
+            return;
+        }
+        while dashboard_shutdown.changed().await.is_ok() {
+            if *dashboard_shutdown.borrow() {
+                return;
+            }
+        }
+    };
 
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+        () = dashboard => {},
     }
     info!("shutdown requested");
 }
@@ -414,6 +485,28 @@ mod tests {
 
         assert_eq!(ipv4.browser_url(), "http://192.0.2.40:8765");
         assert_eq!(ipv6.browser_url(), "http://[2001:db8::40]:8765");
+    }
+
+    #[test]
+    fn request_trace_path_excludes_query_strings() {
+        let request = Request::builder()
+            .uri("/api/jobs?token=must-not-be-logged&search=private")
+            .body(())
+            .unwrap();
+        assert_eq!(request_log_path(&request), "/api/jobs");
+        assert!(!request_log_path(&request).contains("must-not-be-logged"));
+
+        let dynamic = Request::builder()
+            .uri("/api/jobs/private-document-title")
+            .body(())
+            .unwrap();
+        assert_eq!(request_log_path(&dynamic), "/api/jobs/:id");
+
+        let unknown = Request::builder()
+            .uri("/private-dashboard-path")
+            .body(())
+            .unwrap();
+        assert_eq!(request_log_path(&unknown), "/dashboard");
     }
 
     #[test]
@@ -455,5 +548,16 @@ mod tests {
         );
         let seed = std::fs::read_to_string(path.join("paperless-llm.instance")).unwrap();
         assert!(Uuid::parse_str(seed.trim()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dashboard_request_completes_the_graceful_shutdown_signal() {
+        let shutdown = ShutdownHandle::new();
+        let receiver = shutdown.subscribe();
+        shutdown.request();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_signal(receiver))
+            .await
+            .expect("dashboard shutdown signal should complete");
     }
 }

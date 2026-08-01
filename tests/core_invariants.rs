@@ -53,6 +53,52 @@ async fn migration_has_no_foreign_key_violations() {
 }
 
 #[tokio::test]
+async fn live_polling_queries_have_dedicated_indexes() {
+    let (_directory, database) = fixture().await;
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name IN (\
+            'idx_jobs_updated_at','idx_jobs_status_updated_at','idx_usage_events_job_id'\
+         ) ORDER BY name",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        indexes,
+        vec![
+            "idx_jobs_status_updated_at".to_owned(),
+            "idx_jobs_updated_at".to_owned(),
+            "idx_usage_events_job_id".to_owned(),
+        ]
+    );
+
+    let job_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN \
+         SELECT id FROM jobs WHERE status='queued' ORDER BY updated_at DESC LIMIT 50",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        job_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_jobs_status_updated_at"))
+    );
+
+    let usage_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT SUM(total_tokens) FROM usage_events WHERE job_id='job-a'",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        usage_plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_usage_events_job_id"))
+    );
+}
+
+#[tokio::test]
 async fn competing_budget_reservations_cannot_oversubscribe() {
     let (_directory, database) = fixture().await;
     let budget = BudgetService::new(database);

@@ -9,6 +9,8 @@ The default data directories are:
 
 The SQLite database uses write-ahead logging. Stop PaperlessLLM before copying the directory so the database, WAL, and encrypted-secret key form one consistent snapshot.
 
+The examples below create compressed `.tar.gz` files; compression is not encryption. A fallback backup normally contains both encrypted credential rows and the `.master-key` that decrypts them, plus plaintext document titles, suggestions, custom prompts, errors, and statistics. Treat the resulting archive like a credential: keep it mode `0600` in a mode-`0700` directory and encrypt it before moving it to removable, cloud, or shared storage.
+
 ## Back up on Linux
 
 For a systemd user installation:
@@ -16,13 +18,17 @@ For a systemd user installation:
 ```sh
 systemctl --user stop paperless-llm.service
 install -d -m 0700 "$HOME/backups"
+chmod 700 "$HOME/backups"
+umask 077
+backup_path="$HOME/backups/paperless-llm-$(date +%Y%m%d-%H%M%S).tar.gz"
 tar -C "$HOME/.local/share" \
-  -czf "$HOME/backups/paperless-llm-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  -czf "$backup_path" \
   paperless-llm
+chmod 600 "$backup_path"
 systemctl --user start paperless-llm.service
 ```
 
-The generated `.master-key` is included when it lives in the data directory. If the service instead receives `PAPERLESSLLM_MASTER_KEY` from an environment or secrets manager, back up that value separately in a credential vault. A database without its original master key cannot decrypt saved Paperless or provider tokens.
+The generated `.master-key` is included when it lives in the data directory. This makes the archive self-contained for fallback restoration but also means encryption does not protect it from someone who obtains the whole archive. If the service instead receives `PAPERLESSLLM_MASTER_KEY` from an environment or secrets manager, back up that value separately in a credential vault. A database without its original master key cannot decrypt saved Paperless or provider tokens.
 
 ## Back up on macOS
 
@@ -31,23 +37,27 @@ Unload the launch agent, archive the directory, and load the agent again:
 ```sh
 launchctl bootout "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/io.paperlessllm.paperless-llm.plist"
-mkdir -p "$HOME/Backups"
+install -d -m 0700 "$HOME/Backups"
+chmod 700 "$HOME/Backups"
+umask 077
+backup_path="$HOME/Backups/paperless-llm-$(date +%Y%m%d-%H%M%S).tar.gz"
 tar -C "$HOME/Library/Application Support" \
-  -czf "$HOME/Backups/paperless-llm-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  -czf "$backup_path" \
   PaperlessLLM
+chmod 600 "$backup_path"
 launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/io.paperlessllm.paperless-llm.plist"
 ```
 
-Saved tokens use macOS Keychain when it is available and are not contained in this archive. Include the normal encrypted macOS/Keychain backup in the recovery plan, or be prepared to re-enter Paperless and provider tokens after restoring on a different Mac. If Keychain access was unavailable, PaperlessLLM uses the same encrypted SQLite fallback as Linux; in that case the data-directory `.master-key` must be backed up with the database.
+Keychain-backed values are not contained in this archive. Include the normal encrypted macOS/Keychain backup in the recovery plan, or be prepared to re-enter Paperless and provider tokens after restoring on a different Mac. Keychain fallback happens per credential operation, so one installation may also have encrypted values in SQLite. Always preserve any data-directory `.master-key` with the database; the archive command above does so.
 
 ## Restore
 
 Use the same PaperlessLLM version that created the backup, or a newer version. A newer binary may migrate the restored database; that migrated copy cannot necessarily be opened by an older binary.
 
 1. Stop PaperlessLLM.
-2. Move the current data directory aside instead of deleting it.
-3. Extract the archive into the parent directory.
+2. Move the current data directory aside instead of deleting it, and keep that copy private.
+3. Decrypt the backup if necessary, then extract it into the parent directory from a private working location.
 4. Restore the external master key or Keychain entries, if applicable.
 5. Ensure the data directory is owned by the service user and has mode `0700`; the generated `.master-key` must have mode `0600`.
 6. Start PaperlessLLM and check `http://127.0.0.1:8765/healthz`, the dashboard connection status, recent jobs, and token totals.
@@ -71,4 +81,4 @@ If validation fails, stop the service, move the restored directory aside, and mo
 
 ## Backup policy
 
-Take a backup before every upgrade and on a schedule appropriate for the value of review decisions and token statistics. Retain at least one snapshot from the previous application version. Store archives and external master keys in separate encrypted storage, and periodically test a restore on a non-production machine.
+Take a backup before every upgrade and on a schedule appropriate for the value of review decisions and token statistics. Retain at least one snapshot from the previous application version. Encrypt archives at rest and in transit, keep external master keys in a separate credential vault, and periodically test a restore on a private non-production machine. Delete plaintext staging copies securely according to the storage medium's capabilities and retention policy.

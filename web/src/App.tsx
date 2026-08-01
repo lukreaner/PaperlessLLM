@@ -1,16 +1,19 @@
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api/client";
 import type { AppSettings, AppStatus, BootstrapResponse, Catalogs, ProviderProfile } from "./api/types";
 import { Layout } from "./components/Layout";
-import { Button, ErrorState, LoadingState } from "./components/UI";
+import { Button, ConfirmDialog, ErrorState, LoadingState } from "./components/UI";
 import { Logo } from "./components/Logo";
+import { useToast } from "./components/Toast";
 import { ActivityPage } from "./pages/ActivityPage";
 import { LoginPage } from "./pages/LoginPage";
+import { LogsPage } from "./pages/LogsPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { ReviewPage } from "./pages/ReviewPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SetupPage } from "./pages/SetupPage";
 import { StatisticsPage } from "./pages/StatisticsPage";
+import { useVisiblePolling } from "./lib/hooks";
 import { Navigate, useLocation, useNavigate } from "./lib/router";
 
 interface AppContextValue {
@@ -18,6 +21,8 @@ interface AppContextValue {
   settings: AppSettings;
   providers: ProviderProfile[];
   catalogs?: Catalogs;
+  statusLastSuccessAt?: number;
+  statusPollError?: string;
   refreshStatus: () => Promise<void>;
   refreshBootstrap: () => Promise<void>;
   updateSettings: (settings: AppSettings) => void;
@@ -47,12 +52,35 @@ function SetupComplete({ onComplete }: { onComplete: () => Promise<void> }) {
   return <SetupPage onComplete={async () => { await onComplete(); navigate("/"); }} />;
 }
 
+function StoppedScreen() {
+  return (
+    <div className="startup-screen stopped-screen">
+      <Logo />
+      <div className="startup-card stopped-card">
+        <span className="stopped-card__mark" aria-hidden="true">✓</span>
+        <h1>PaperlessLLM has stopped</h1>
+        <p>The local service is closed. You can safely close this browser tab.</p>
+        <p className="stopped-card__restart">
+          To use it again, open <strong>PaperlessLLM</strong> from your applications menu, or double-click <strong>PaperlessLLM.app</strong> on macOS.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const location = useLocation();
+  const { showToast } = useToast();
   const [bootstrap, setBootstrap] = useState<BootstrapResponse>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [needsLogin, setNeedsLogin] = useState(false);
+  const [quitOpen, setQuitOpen] = useState(false);
+  const [quitting, setQuitting] = useState(false);
+  const [stopped, setStopped] = useState(false);
+  const [statusLastSuccessAt, setStatusLastSuccessAt] = useState<number>();
+  const [statusPollError, setStatusPollError] = useState<string>();
+  const statusInFlight = useRef<Promise<void> | undefined>(undefined);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -60,6 +88,8 @@ export default function App() {
     try {
       const result = await api.bootstrap();
       setBootstrap(result);
+      setStatusLastSuccessAt(Date.now());
+      setStatusPollError(undefined);
       setNeedsLogin(result.status.auth.required && !result.status.auth.authenticated);
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 401) {
@@ -74,13 +104,26 @@ export default function App() {
 
   useEffect(() => { void load(); }, [load]);
 
-  const refreshStatus = useCallback(async () => {
-    try {
-      const status = await api.status();
-      setBootstrap((current) => current ? { ...current, status } : current);
-    } catch (caught) {
-      if (caught instanceof ApiError && caught.status === 401) setNeedsLogin(true);
-    }
+  const refreshStatus = useCallback(() => {
+    // Status polling is single-flight: a slow response cannot be overtaken by
+    // a newer request and overwrite fresher worker state later.
+    if (statusInFlight.current) return statusInFlight.current;
+    let request!: Promise<void>;
+    request = (async () => {
+      try {
+        const status = await api.status();
+        setBootstrap((current) => current ? { ...current, status } : current);
+        setStatusLastSuccessAt(Date.now());
+        setStatusPollError(undefined);
+      } catch (caught) {
+        if (caught instanceof ApiError && caught.status === 401) setNeedsLogin(true);
+        setStatusPollError(caught instanceof Error ? caught.message : "Live status is unavailable.");
+      } finally {
+        if (statusInFlight.current === request) statusInFlight.current = undefined;
+      }
+    })();
+    statusInFlight.current = request;
+    return request;
   }, []);
 
   const logout = useCallback(async () => {
@@ -92,12 +135,22 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!bootstrap || bootstrap.status.setup_required || needsLogin) return;
-    const interval = window.setInterval(() => void refreshStatus(), 30_000);
-    return () => window.clearInterval(interval);
-  }, [bootstrap, needsLogin, refreshStatus]);
+  const quit = useCallback(async () => {
+    setQuitting(true);
+    try {
+      await api.shutdown();
+      setQuitOpen(false);
+      setStopped(true);
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : "PaperlessLLM could not be stopped.", "error");
+      setQuitting(false);
+    }
+  }, [showToast]);
 
+  const statusPollingEnabled = Boolean(bootstrap && !bootstrap.status.setup_required && !needsLogin && !stopped);
+  useVisiblePolling(refreshStatus, 2_000, statusPollingEnabled);
+
+  if (stopped) return <StoppedScreen />;
   if (loading && !bootstrap) return <div className="startup-screen"><Logo /><LoadingState label="Opening your workspace" /></div>;
   if (error && !bootstrap) return <StartupError message={error} onRetry={() => void load()} />;
   if (needsLogin) return <LoginPage onAuthenticated={() => { setNeedsLogin(false); void load(); }} />;
@@ -108,6 +161,8 @@ export default function App() {
     settings: bootstrap.settings,
     providers: bootstrap.providers,
     catalogs: bootstrap.catalogs,
+    statusLastSuccessAt,
+    statusPollError,
     refreshStatus,
     refreshBootstrap: load,
     updateSettings: (settings) => setBootstrap((current) => current ? { ...current, settings } : current),
@@ -125,9 +180,21 @@ export default function App() {
 
   return (
     <AppContext.Provider value={value}>
-      <Layout status={bootstrap.status} onRefreshStatus={() => void refreshStatus()} onLogout={() => void logout()}>
+      <Layout status={bootstrap.status} onRefreshStatus={() => void refreshStatus()} onLogout={() => void logout()} onQuit={() => setQuitOpen(true)}>
         <AppRoute pathname={location.pathname} />
       </Layout>
+      <ConfirmDialog
+        open={quitOpen}
+        title="Quit PaperlessLLM?"
+        description={bootstrap.status.worker.active_job_id
+          ? "A document is being processed. Quitting now interrupts it; PaperlessLLM will safely resume it after restart."
+          : "This stops the local scanner and closes PaperlessLLM. Your settings, history, and Paperless documents are kept."}
+        confirmLabel="Quit PaperlessLLM"
+        danger
+        busy={quitting}
+        onCancel={() => setQuitOpen(false)}
+        onConfirm={() => void quit()}
+      />
     </AppContext.Provider>
   );
 }
@@ -137,6 +204,7 @@ function AppRoute({ pathname }: { pathname: string }) {
   if (pathname === "/review") return <ReviewPage />;
   if (pathname === "/activity") return <ActivityPage />;
   if (pathname === "/statistics") return <StatisticsPage />;
+  if (pathname === "/logs") return <LogsPage />;
   if (pathname === "/settings") return <SettingsPage />;
   if (pathname === "/setup") return <Navigate to="/settings" replace />;
   return <NotFound />;

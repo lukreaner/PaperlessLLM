@@ -1,5 +1,5 @@
 use paperless_llm::paperless::{
-    DocumentQuery, PaperlessClient, PaperlessDocument, TriggerMatchMode,
+    DocumentLimit, DocumentQuery, PaperlessClient, PaperlessDocument, TriggerMatchMode,
 };
 use serde_json::json;
 use wiremock::{
@@ -65,11 +65,78 @@ async fn follows_same_origin_pagination_and_parses_nested_tags() {
 }
 
 #[tokio::test]
+async fn rebases_proxy_pagination_without_contacting_its_advertised_origin() {
+    let server = MockServer::start().await;
+    let advertised_origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags/"))
+        .and(query_param("page_size", "1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":2,
+            "next":format!(
+                "{}/reverse-proxy-prefix/api/tags/?page=2",
+                advertised_origin.uri()
+            ),
+            "results":[{"id":1,"name":"First"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags/"))
+        .and(query_param("page", "2"))
+        .and(header("authorization", "Token paperless-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":2,"next":null,"results":[{"id":2,"name":"Second"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let tags = client(&server).list_tags().await.unwrap();
+
+    assert_eq!(tags.len(), 2);
+    assert!(
+        advertised_origin
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn rejects_pagination_links_for_a_different_api_endpoint() {
+    let server = MockServer::start().await;
+    let advertised_origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":2,
+            "next":format!("{}/api/documents/?page=2", advertised_origin.uri()),
+            "results":[{"id":1,"name":"First"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client(&server).list_tags().await.unwrap_err();
+
+    assert!(error.to_string().contains("unsafe pagination URL"));
+    assert!(
+        advertised_origin
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn sends_all_trigger_filter_and_keeps_version_checksum() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/documents/"))
         .and(query_param("tags__id__all", "3,5"))
+        .and(query_param("fields", "id,title,versions"))
+        .and(query_param("ordering", "added,id"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "count":1,"next":null,"results":[{
                 "id":42,"title":"Invoice","content":"text","tags":[3,5],
@@ -81,16 +148,160 @@ async fn sends_all_trigger_filter_and_keeps_version_checksum() {
         })))
         .mount(&server)
         .await;
-    let documents = client(&server)
-        .list_documents(&DocumentQuery {
+    let client = client(&server);
+    let mut pages = client
+        .document_pages(&DocumentQuery {
             trigger_tag_ids: vec![3, 5],
             trigger_match_mode: TriggerMatchMode::All,
             excluded_tag_id: None,
-            limit: 10,
+            limit: DocumentLimit::from_persisted(10),
         })
-        .await
         .unwrap();
+    let documents = pages.next_page().await.unwrap().unwrap();
     assert_eq!(documents[0].effective_checksum(), "latest-sha");
+    assert!(pages.next_page().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn document_discovery_stops_at_the_requested_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/documents/"))
+        .and(query_param("page_size", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":2,
+            "next":"https://proxy-advertised.example/api/documents/?page=2",
+            "results":[{"id":1,"title":"First","versions":[]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let mut pages = client
+        .document_pages(&DocumentQuery {
+            trigger_tag_ids: vec![],
+            trigger_match_mode: TriggerMatchMode::Any,
+            excluded_tag_id: None,
+            limit: DocumentLimit::from_persisted(1),
+        })
+        .unwrap();
+
+    let documents = pages.next_page().await.unwrap().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].id, 1);
+    assert!(pages.next_page().await.unwrap().is_none());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn document_discovery_cap_is_enforced_across_page_boundaries() {
+    let server = MockServer::start().await;
+    let first_page = (1..=40)
+        .map(|id| json!({"id":id,"title":format!("Document {id}"),"versions":[]}))
+        .collect::<Vec<_>>();
+    let second_page = (41..=75)
+        .map(|id| json!({"id":id,"title":format!("Document {id}"),"versions":[]}))
+        .collect::<Vec<_>>();
+    Mock::given(method("GET"))
+        .and(path("/api/documents/"))
+        .and(query_param("page_size", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":75,
+            "next":format!("{}/api/documents/?page=2", server.uri()),
+            "results":first_page
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/documents/"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":75,
+            "next":"https://proxy-advertised.example/api/documents/?page=3&page_size=50",
+            "results":second_page
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let mut pages = client
+        .document_pages(&DocumentQuery {
+            trigger_tag_ids: vec![],
+            trigger_match_mode: TriggerMatchMode::Any,
+            excluded_tag_id: None,
+            limit: DocumentLimit::from_persisted(50),
+        })
+        .unwrap();
+
+    assert_eq!(pages.next_page().await.unwrap().unwrap().len(), 40);
+    let final_page = pages.next_page().await.unwrap().unwrap();
+    assert_eq!(final_page.len(), 10);
+    assert_eq!(final_page.last().map(|document| document.id), Some(50));
+    assert!(pages.next_page().await.unwrap().is_none());
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn unlimited_document_discovery_follows_pages_beyond_fifty_results() {
+    let server = MockServer::start().await;
+    let first_page = (1..=40)
+        .map(|id| json!({"id":id,"title":format!("Document {id}"),"versions":[]}))
+        .collect::<Vec<_>>();
+    let second_page = (41..=75)
+        .map(|id| json!({"id":id,"title":format!("Document {id}"),"versions":[]}))
+        .collect::<Vec<_>>();
+
+    Mock::given(method("GET"))
+        .and(path("/api/documents/"))
+        .and(query_param("page_size", "1000"))
+        .and(query_param("tags__id__in", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":75,
+            "next":format!("{}/api/documents/?page=2&tags__id__in=7", server.uri()),
+            "results":first_page
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/documents/"))
+        .and(query_param("page", "2"))
+        .and(query_param("tags__id__in", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "count":75,
+            "next":null,
+            "results":second_page
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let mut pages = client
+        .document_pages(&DocumentQuery {
+            trigger_tag_ids: vec![7],
+            trigger_match_mode: TriggerMatchMode::Any,
+            excluded_tag_id: None,
+            limit: DocumentLimit::All,
+        })
+        .unwrap();
+
+    let first = pages.next_page().await.unwrap().unwrap();
+    assert_eq!(first.len(), 40);
+    assert_eq!(first.first().map(|document| document.id), Some(1));
+    drop(first);
+
+    let second = pages.next_page().await.unwrap().unwrap();
+    assert_eq!(second.len(), 35);
+    assert_eq!(second.first().map(|document| document.id), Some(41));
+    assert_eq!(second.last().map(|document| document.id), Some(75));
+    drop(second);
+
+    assert!(pages.next_page().await.unwrap().is_none());
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

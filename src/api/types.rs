@@ -22,14 +22,37 @@ pub struct ConnectionHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveJobDto {
+    pub id: String,
+    pub document_id: i64,
+    pub document_title: String,
+    pub state: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanProgressDto {
+    pub trigger: String,
+    pub discovered: usize,
+    pub queued: usize,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStatusDto {
     pub state: String,
+    #[serde(default)]
+    pub paused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scan_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_scan_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_job: Option<ActiveJobDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_progress: Option<ScanProgressDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +113,10 @@ pub struct OverwriteSettings {
 #[serde(default)]
 pub struct ProcessingSettings {
     pub poll_interval_minutes: u64,
+    /// `None` means every matching Paperless document is discovered. A value
+    /// sets an optional per-scan ceiling without changing the bounded API page
+    /// size used by the Paperless client.
+    pub max_documents_per_scan: Option<u64>,
     pub review_mode: bool,
     pub use_existing_correspondents_and_tags: bool,
     pub process_only_tagged: bool,
@@ -111,6 +138,7 @@ impl Default for ProcessingSettings {
     fn default() -> Self {
         Self {
             poll_interval_minutes: 5,
+            max_documents_per_scan: None,
             review_mode: false,
             use_existing_correspondents_and_tags: true,
             process_only_tagged: false,

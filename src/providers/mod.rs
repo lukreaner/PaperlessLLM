@@ -52,7 +52,6 @@ pub(crate) struct HttpJson {
 pub(crate) async fn receive_json(
     response: reqwest::Response,
     operation: &'static str,
-    secrets: &[&str],
 ) -> Result<HttpJson, ProviderError> {
     let status = response.status();
     let request_id = response
@@ -61,13 +60,15 @@ pub(crate) async fn receive_json(
         .or_else(|| response.headers().get("request-id"))
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
+    if !status.is_success() {
+        // Do not read a rejected response body. Providers may echo document
+        // input, prompts, or credentials in diagnostic messages.
+        return Err(ProviderError::remote(operation, status));
+    }
     let body = response
         .text()
         .await
         .map_err(|error| ProviderError::transport(operation, error))?;
-    if !status.is_success() {
-        return Err(ProviderError::remote(operation, status, &body, secrets));
-    }
     let value = serde_json::from_str(&body).map_err(|_| {
         ProviderError::InvalidResponse(format!(
             "{operation} response was not valid JSON (HTTP {})",

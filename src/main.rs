@@ -6,6 +6,8 @@ use directories::BaseDirs;
 use paperless_llm::RuntimeOptions;
 use tracing_subscriber::EnvFilter;
 
+const DESKTOP_LOG_DIRECTIVES: &str = "paperless_llm=info";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "paperless-llm",
@@ -59,6 +61,9 @@ struct ServeArgs {
     /// Do not open a browser (useful in service files).
     #[arg(long, conflicts_with = "open_browser")]
     no_open: bool,
+    /// Write bounded diagnostics for a child started by the desktop launcher.
+    #[arg(long, hide = true)]
+    desktop_log: bool,
 }
 
 #[derive(Debug, Args)]
@@ -72,25 +77,39 @@ struct LaunchArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("paperless_llm=info,tower_http=info")),
-        )
-        .with_target(false)
-        .compact()
-        .init();
-
     let command = Cli::parse_from(filtered_process_arguments())
         .command
         .expect("launch subcommand is inserted when none is supplied");
     match command {
         Command::Serve(args) => {
-            paperless_llm::run(args.runtime.options(args.open_browser && !args.no_open)?)
-                .await
-                .context("PaperlessLLM stopped with an error")?;
+            let desktop_log = args.desktop_log;
+            let options = args.runtime.options(args.open_browser && !args.no_open)?;
+            if desktop_log {
+                init_desktop_tracing(&options.data_dir)?;
+            } else {
+                init_console_tracing()?;
+            }
+            let result = paperless_llm::run(options).await;
+            if let Err(error) = &result {
+                tracing::error!(
+                    event = "service.fatal",
+                    target = "service",
+                    status = "error",
+                    error_code = paperless_llm::diagnostics::safe_error_code(error),
+                    "service stopped with an error"
+                );
+            } else {
+                tracing::info!(
+                    event = "service.stopped",
+                    target = "service",
+                    status = "completed",
+                    "service stopped"
+                );
+            }
+            result.context("PaperlessLLM stopped with an error")?;
         }
         Command::Launch(args) => {
+            init_console_tracing()?;
             let show_error = !args.no_open;
             let result =
                 paperless_llm::launcher::launch(args.runtime.options(!args.no_open)?).await;
@@ -103,6 +122,42 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn console_log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("paperless_llm=info,tower_http=info"))
+}
+
+fn desktop_log_filter() -> EnvFilter {
+    // Desktop logs are persisted and may later be inspected through the safe
+    // dashboard projection. Never honor process environment directives here:
+    // dependency debug traces can contain headers or response bodies before
+    // that projection has an opportunity to reject them.
+    EnvFilter::new(DESKTOP_LOG_DIRECTIVES)
+}
+
+fn init_console_tracing() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(console_log_filter())
+        .with_target(false)
+        .compact()
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("could not initialize console logging: {error}"))
+}
+
+fn init_desktop_tracing(data_dir: &std::path::Path) -> Result<()> {
+    let writer = paperless_llm::diagnostics::desktop_log_writer(data_dir)
+        .context("could not initialize the private desktop log")?;
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(desktop_log_filter())
+        .with_target(false)
+        .compact()
+        .with_writer(writer)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("could not initialize desktop logging: {error}"))
 }
 
 fn filtered_process_arguments() -> Vec<OsString> {
@@ -163,5 +218,11 @@ mod tests {
             panic!("Finder launch should select launch mode after filtering");
         };
         assert!(!arguments.no_open);
+    }
+
+    #[test]
+    fn desktop_log_filter_is_fixed_to_application_info_events() {
+        assert_eq!(DESKTOP_LOG_DIRECTIVES, "paperless_llm=info");
+        assert_eq!(desktop_log_filter().to_string(), DESKTOP_LOG_DIRECTIVES);
     }
 }

@@ -14,6 +14,7 @@ pub const CONNECTION_ID: &str = "default";
 pub const PROCESSING_PROFILE_ID: &str = "default";
 pub const PAPERLESS_TOKEN_KEY: &str = "paperless:default:token";
 const SETTINGS_KEY: &str = "dashboard_settings";
+pub const ACTIVE_PROVIDER_SETTING_KEY: &str = "active_provider_id";
 const CATALOG_CACHE_KEY: &str = "paperless_catalog_cache";
 
 pub async fn load_settings(state: &AppState) -> AppResult<AppSettings> {
@@ -126,8 +127,15 @@ pub async fn save_settings(state: &AppState, mut settings: AppSettings) -> AppRe
 
     let mut persisted = settings.clone();
     persisted.redact_secrets();
+    state
+        .database
+        .set_setting(ACTIVE_PROVIDER_SETTING_KEY, &persisted.active_provider_id)
+        .await?;
     state.database.set_setting(SETTINGS_KEY, &persisted).await?;
     state.set_configured_lan(persisted.security.lan_enabled);
+    // Budget increases and other processing changes should wake durable
+    // waiting work immediately. The notification is intentionally best-effort.
+    state.worker.notify_state_changed();
     load_settings(state).await
 }
 
@@ -142,15 +150,16 @@ async fn upsert_processing_profile(
     sqlx::query(
         "INSERT INTO processing_profiles(\
             id,name,paperless_connection_id,provider_profile_id,enabled,automatic_mode,poll_interval_seconds,\
-            use_existing_data,process_pre_tagged_only,trigger_tag_ids_json,trigger_match_mode,\
+            max_documents_per_scan,use_existing_data,process_pre_tagged_only,trigger_tag_ids_json,trigger_match_mode,\
             restrict_tags,restrict_correspondents,restrict_document_types,add_processed_tag,processed_tag_name,\
             tags_enabled,correspondent_enabled,document_type_enabled,title_enabled,custom_fields_enabled,\
             overwrite_tags,overwrite_correspondent,overwrite_document_type,overwrite_title,prompt_mode,custom_prompt,\
             max_input_tokens,include_document_file,file_rendition,max_file_bytes,max_file_pages,ocr_excerpt_tokens,\
             daily_budget_tokens,monthly_budget_tokens,budget_timezone,warning_threshold_percent,updated_at\
-         ) VALUES(?, 'Default', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+         ) VALUES(?, 'Default', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
          ON CONFLICT(id) DO UPDATE SET provider_profile_id=excluded.provider_profile_id,enabled=1,automatic_mode=excluded.automatic_mode,\
-            poll_interval_seconds=excluded.poll_interval_seconds,use_existing_data=excluded.use_existing_data,process_pre_tagged_only=excluded.process_pre_tagged_only,\
+            poll_interval_seconds=excluded.poll_interval_seconds,max_documents_per_scan=excluded.max_documents_per_scan,\
+            use_existing_data=excluded.use_existing_data,process_pre_tagged_only=excluded.process_pre_tagged_only,\
             trigger_tag_ids_json=excluded.trigger_tag_ids_json,trigger_match_mode=excluded.trigger_match_mode,restrict_tags=excluded.restrict_tags,\
             restrict_correspondents=excluded.restrict_correspondents,restrict_document_types=excluded.restrict_document_types,add_processed_tag=excluded.add_processed_tag,\
             processed_tag_name=excluded.processed_tag_name,tags_enabled=excluded.tags_enabled,correspondent_enabled=excluded.correspondent_enabled,\
@@ -167,6 +176,7 @@ async fn upsert_processing_profile(
     .bind(&provider.id)
     .bind(if processing.review_mode { "review" } else { "automatic" })
     .bind((processing.poll_interval_minutes * 60) as i64)
+    .bind(processing.max_documents_per_scan.unwrap_or(0) as i64)
     .bind(processing.use_existing_correspondents_and_tags)
     .bind(processing.process_only_tagged)
     .bind(serde_json::to_string(&processing.trigger_tag_ids)?)
@@ -291,6 +301,15 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
             "polling interval must be between 1 and 1440 minutes".to_owned(),
         ));
     }
+    if settings
+        .processing
+        .max_documents_per_scan
+        .is_some_and(|limit| !(1..=1_000_000).contains(&limit))
+    {
+        return Err(AppError::Validation(
+            "maximum documents per scan must be between 1 and 1000000, or empty for all".to_owned(),
+        ));
+    }
     if !matches!(settings.processing.trigger_match.as_str(), "any" | "all") {
         return Err(AppError::Validation(
             "trigger matching must be Any or All".to_owned(),
@@ -400,14 +419,112 @@ fn normalize_limit(value: Option<i64>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RuntimeOptions, app};
 
     #[test]
     fn defaults_match_v1_guardrails() {
         let settings = AppSettings::default();
         assert_eq!(settings.processing.poll_interval_minutes, 5);
+        assert_eq!(settings.processing.max_documents_per_scan, None);
         assert_eq!(settings.limits.max_input_tokens, 32_000);
         assert_eq!(settings.limits.max_output_tokens, 8_000);
         assert!(settings.processing.restrict_existing_tags);
         assert_eq!(settings.processing.processed_tag_name, "ai-processed");
+    }
+
+    #[tokio::test]
+    async fn settings_persist_all_documents_or_an_explicit_scan_cap() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = app::initialize(RuntimeOptions {
+            data_dir: directory.path().to_owned(),
+            bind: "127.0.0.1".parse().expect("loopback address"),
+            port: 8765,
+            open_browser: false,
+        })
+        .await
+        .expect("application state");
+        sqlx::query(
+            "INSERT INTO paperless_connections(id,name,base_url,token_secret_key) \
+             VALUES(?,?,?,?)",
+        )
+        .bind(CONNECTION_ID)
+        .bind("Paperless")
+        .bind("http://localhost:8000")
+        .bind(PAPERLESS_TOKEN_KEY)
+        .execute(state.database.pool())
+        .await
+        .expect("Paperless connection");
+        sqlx::query(
+            "INSERT INTO provider_profiles(id,name,provider_kind,base_url,model,api_family) \
+             VALUES('provider','Local','lmstudio','http://localhost:1234/v1','model','responses')",
+        )
+        .execute(state.database.pool())
+        .await
+        .expect("provider profile");
+        let provider: ProviderProfileRecord =
+            sqlx::query_as("SELECT * FROM provider_profiles WHERE id='provider'")
+                .fetch_one(state.database.pool())
+                .await
+                .expect("saved provider profile");
+
+        let mut settings = AppSettings::default();
+        upsert_processing_profile(&state, &settings, &provider)
+            .await
+            .expect("save unlimited discovery profile");
+        let unlimited: i64 =
+            sqlx::query_scalar("SELECT max_documents_per_scan FROM processing_profiles WHERE id=?")
+                .bind(PROCESSING_PROFILE_ID)
+                .fetch_one(state.database.pool())
+                .await
+                .expect("unlimited scan setting");
+        assert_eq!(unlimited, 0);
+
+        settings.processing.max_documents_per_scan = Some(2_500);
+        upsert_processing_profile(&state, &settings, &provider)
+            .await
+            .expect("save capped discovery profile");
+        let capped: i64 =
+            sqlx::query_scalar("SELECT max_documents_per_scan FROM processing_profiles WHERE id=?")
+                .bind(PROCESSING_PROFILE_ID)
+                .fetch_one(state.database.pool())
+                .await
+                .expect("capped scan setting");
+        assert_eq!(capped, 2_500);
+    }
+
+    #[tokio::test]
+    async fn migration_replaces_only_the_legacy_fifty_document_default() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::query(
+            "CREATE TABLE processing_profiles(id TEXT PRIMARY KEY, max_documents_per_scan INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("processing profile table");
+        sqlx::query(
+            "INSERT INTO processing_profiles(id,max_documents_per_scan) VALUES('legacy',50),('custom',250)",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy rows");
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0003_unlimited_document_scans.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("scan-limit migration");
+
+        let values: Vec<(String, i64)> =
+            sqlx::query_as("SELECT id,max_documents_per_scan FROM processing_profiles ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("migrated limits");
+        assert_eq!(
+            values,
+            vec![("custom".to_owned(), 250), ("legacy".to_owned(), 0)]
+        );
     }
 }

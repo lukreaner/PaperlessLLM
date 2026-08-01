@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
@@ -64,7 +64,7 @@ jobs:
           fi
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -83,12 +83,13 @@ jobs:
           sudo apt-get install --yes musl-tools
 
       - name: Install Rust target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master 2026-07-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: release-${{ matrix.target }}
 
@@ -335,7 +336,7 @@ jobs:
           tar -C "$RUNNER_TEMP" -czf "$archive_name.tar.gz" "$archive_name"
 
       - name: Upload packaged binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package-${{ matrix.target }}
           path: paperless-llm-*.tar.gz
@@ -358,7 +359,7 @@ jobs:
       contents: write
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: package-*
           path: release-artifacts

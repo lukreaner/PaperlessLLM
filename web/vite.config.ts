@@ -10,7 +10,14 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:3000",
+      "/api": {
+        target: "http://127.0.0.1:3000",
+        changeOrigin: true,
+        // The production dashboard and API share an origin. Mirror that in
+        // development so the backend's localhost Host/Origin guard remains
+        // exercised instead of being disabled for Vite's separate port.
+        headers: { Origin: "http://127.0.0.1:3000" },
+      },
       "/healthz": "http://127.0.0.1:3000",
     },
   },
