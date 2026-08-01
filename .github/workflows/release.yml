@@ -161,14 +161,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          binary="target/${{ matrix.target }}/release/paperless-llm"
           bundle="target/${{ matrix.target }}/release/PaperlessLLM.app"
+          codesign --force --sign - "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
           packaging/macos/create-app-bundle.sh \
-            --binary "target/${{ matrix.target }}/release/paperless-llm" \
+            --binary "$binary" \
             --version "${RELEASE_TAG#v}" \
             --build-version "$GITHUB_RUN_NUMBER" \
             --output "$bundle"
           plutil -lint "$bundle/Contents/Info.plist"
           test "$(plutil -extract CFBundleExecutable raw "$bundle/Contents/Info.plist")" = "paperless-llm"
+          codesign --verify --strict --verbose=2 "$bundle/Contents/MacOS/paperless-llm"
+          codesign --verify --deep --strict --verbose=2 "$bundle"
           "$bundle/Contents/MacOS/paperless-llm" --help >/dev/null
 
       - name: Smoke test CLI and health endpoint
@@ -531,6 +536,8 @@ jobs:
       - name: Create release archive
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          MACOS_NOTARIZED: ${{ steps.apple_credentials.outputs.notarization }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
@@ -542,11 +549,27 @@ jobs:
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             ditto "target/${{ matrix.target }}/release/PaperlessLLM.app" "$stage/PaperlessLLM.app"
             test -x "$stage/PaperlessLLM.app/Contents/MacOS/paperless-llm"
+            codesign --verify --strict --verbose=2 "$stage/PaperlessLLM.app/Contents/MacOS/paperless-llm"
+            codesign --verify --deep --strict --verbose=2 "$stage/PaperlessLLM.app"
           fi
           cp LICENSE "$stage/LICENSE"
           cp -R docs "$stage/docs"
           cp -R packaging "$stage/packaging"
           tar -C "$RUNNER_TEMP" -czf "$archive_name.tar.gz" "$archive_name"
+
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            verify_root="$(mktemp -d "$RUNNER_TEMP/paperless-llm-release-verify.XXXXXX")"
+            tar -C "$verify_root" -xzf "$archive_name.tar.gz"
+            extracted="$verify_root/$archive_name"
+            codesign --verify --strict --verbose=2 "$extracted/paperless-llm"
+            codesign --verify --strict --verbose=2 "$extracted/PaperlessLLM.app/Contents/MacOS/paperless-llm"
+            codesign --verify --deep --strict --verbose=2 "$extracted/PaperlessLLM.app"
+            if [[ "$MACOS_NOTARIZED" == "true" ]]; then
+              xcrun stapler validate "$extracted/PaperlessLLM.app"
+              spctl --assess --type execute --verbose=4 "$extracted/PaperlessLLM.app"
+            fi
+            rm -rf "$verify_root"
+          fi
 
       - name: Create Windows release archive
         if: runner.os == 'Windows'

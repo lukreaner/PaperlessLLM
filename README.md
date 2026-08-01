@@ -11,7 +11,8 @@ The service runtime is one native executable. The Rust service, worker, SQLite m
 - First-class Mistral, Kimi (global), Moonshot (China), and Google Gemini presets over their OpenAI-compatible Chat Completions APIs
 - LM Studio and custom OpenAI-compatible endpoints using explicitly selected Responses or Chat Completions transports
 - Model discovery plus manual model IDs; no hard-coded model allowlist
-- Automatic processing or a per-document review queue
+- Explicit Automatic or Review-before-applying workflow selection
+- Configurable parallel AI analysis for 1–8 documents, with serialized conservative Paperless writes
 - Full paginated discovery by default, with an optional explicit per-scan document cap
 - Two-second live Overview and Activity updates with current document/scan progress
 - Durable pause/continue controls and safe removal of queued or budget-blocked items
@@ -46,7 +47,7 @@ Download the archive for your platform and verify it against `SHA256SUMS` before
 
 On 64-bit Windows, extract the ZIP and double-click **Install PaperlessLLM.cmd**. The current-user installer needs no administrator permission, creates a Start-menu shortcut, and optionally creates a Desktop shortcut. You can also use the archive portably by keeping both executables together and double-clicking `PaperlessLLM.exe`. The Windows executables statically link their C runtime, so the archive does not require a separate Microsoft Visual C++ Redistributable installation.
 
-On macOS, move `PaperlessLLM.app` to Applications if desired, then double-click it. On Linux, run the included current-user installer once:
+On macOS, move `PaperlessLLM.app` to Applications if desired, then double-click it. During an upgrade, a new launcher refuses to reuse a resident service from another build and tells you to quit the old dashboard before relaunching, preventing stale embedded UI assets. On Linux, run the included current-user installer once:
 
 ```sh
 ./packaging/linux/install-desktop.sh
@@ -103,9 +104,9 @@ On Windows, the final command is `.\target\release\paperless-llm.exe serve --ope
 
 The wizard verifies Paperless-ngx v3/API v10, saves a provider profile and model, configures automatic or review processing, selects the enabled AI functions, and establishes token limits. Polling defaults to every five minutes and **Scan now** is available from the Overview page. A blank **Maximum documents per scan** means every matching document: PaperlessLLM follows Paperless pagination in bounded pages instead of stopping after the first 50 results. Set an explicit cap only when you intentionally want one.
 
-Overview and Activity refresh live while their browser tab is visible. They show the current document or scan progress, expose **Pause processing** / **Continue processing**, and let you remove queued or budget-blocked jobs from an expanded Activity row. Pausing is durable across restarts and takes effect after an already-running document or scan reaches its safe boundary; queued work is preserved.
+Overview and Activity refresh live while their browser tab is visible. They show every concurrently active document or the current scan progress, expose **Pause processing** / **Continue processing**, and let you remove queued or budget-blocked jobs from an expanded Activity row. Pausing is durable across restarts and takes effect after already-running documents or a scan reach their safe boundary; queued work is preserved. Under **Settings → Processing**, choose Automatic or Review-before-applying and set **Parallel AI analyses** from 1–8. The default is 1; higher values consume provider quota concurrently, while Paperless taxonomy creation and final metadata writes remain serialized.
 
-The **Logs** page shows recent structured desktop-service events, current worker timing, scan/provider/document lifecycle details, token counts and latency, safe-field search and filters, five-second auto-refresh, and a manual **Refresh** action for troubleshooting. Desktop diagnostic logs rotate at roughly 4 MiB with one private previous generation; only the bounded current generation is available through the dashboard.
+The **Logs** page shows recent structured desktop-service events, current worker timing, scan/provider/document lifecycle details, token counts and latency, safe-field search and filters, five-second auto-refresh, and a manual **Refresh** action for troubleshooting. Failed Activity rows include a safe failure category and phase plus provider kind, model, API family, operation, attempt, latency, HTTP status or timeout state when known. Prompts, OCR text, credentials, custom headers, and upstream response bodies remain excluded. Desktop diagnostic logs rotate at roughly 4 MiB with one private previous generation; only the bounded current generation is available through the dashboard.
 
 Temperature is absent unless explicitly configured and supported by the tested adapter. Reasoning, thinking, structured-output, sampling, and output-limit fields are likewise serialized only for compatible transports. Invalid prompt-only JSON receives at most one budgeted repair request; PaperlessLLM never silently switches providers.
 

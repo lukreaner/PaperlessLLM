@@ -661,13 +661,44 @@ pub fn safe_error_summary(error: &AppError) -> String {
 /// derived from documents, configuration, paths, or upstream response bodies.
 pub fn safe_error_code(error: &AppError) -> &'static str {
     match error {
+        AppError::NotFound(message) if message == "Paperless connection not found" => {
+            "paperless_configuration"
+        }
+        AppError::NotFound(message) if message == "Paperless object not found" => {
+            "paperless_not_found"
+        }
         AppError::NotFound(_) => "not_found",
         AppError::Unauthorized => "authentication_required",
         AppError::Forbidden(_) => "forbidden",
+        AppError::Validation(message) if message == "provider configuration failed" => {
+            "provider_configuration"
+        }
+        AppError::Validation(message) if is_paperless_configuration_error(message) => {
+            "paperless_configuration"
+        }
         AppError::Validation(_) => "validation_failed",
         AppError::Conflict(message) if message == "worker is paused" => "worker_paused",
         AppError::Conflict(_) => "conflict",
         AppError::Budget(_) => "budget_exhausted",
+        AppError::Upstream(message) if message == "Paperless authentication failed" => {
+            "paperless_authentication"
+        }
+        AppError::Upstream(message) if message == "Paperless API permissions are insufficient" => {
+            "paperless_forbidden"
+        }
+        AppError::Upstream(message)
+            if matches!(
+                message.as_str(),
+                "Paperless request timed out"
+                    | "Could not connect to Paperless"
+                    | "Paperless request failed"
+            ) =>
+        {
+            "paperless_transport"
+        }
+        AppError::Upstream(message) if is_paperless_configuration_error(message) => {
+            "paperless_configuration"
+        }
         AppError::Upstream(message)
             if message == "Paperless pagination attempted to leave the configured origin" =>
         {
@@ -675,6 +706,27 @@ pub fn safe_error_code(error: &AppError) -> &'static str {
         }
         AppError::Upstream(message) if message.starts_with("Paperless returned ") => {
             "paperless_http_error"
+        }
+        AppError::Upstream(message) if message.contains("Paperless") => "paperless_error",
+        AppError::Upstream(message)
+            if message == "structured output repair failed"
+                || message == "provider returned invalid analysis fields"
+                || (message.starts_with("provider ")
+                    && (message.contains("invalid structured output")
+                        || message.contains("invalid response"))) =>
+        {
+            "invalid_structured_output"
+        }
+        AppError::Upstream(message)
+            if message.starts_with("provider ") && message.contains("HTTP ") =>
+        {
+            "provider_remote"
+        }
+        AppError::Upstream(message)
+            if message.starts_with("provider ")
+                && (message.contains("timed out") || message.contains("request failed")) =>
+        {
+            "provider_transport"
         }
         AppError::Upstream(message) if message.starts_with("provider ") => "provider_error",
         AppError::Upstream(_) => "upstream_error",
@@ -685,6 +737,114 @@ pub fn safe_error_code(error: &AppError) -> &'static str {
         AppError::Url(_) => "url_error",
         AppError::Internal(_) => "internal_error",
     }
+}
+
+fn is_paperless_configuration_error(message: &str) -> bool {
+    matches!(
+        message,
+        "Paperless is not configured"
+            | "Paperless API token is not configured"
+            | "Paperless URL must be an absolute HTTP(S) URL"
+            | "the configured Paperless CA certificate is invalid"
+            | "Paperless token contains invalid characters"
+            | "Paperless did not report an API version"
+            | "Paperless-ngx v3 is required; server did not report a valid version"
+            | "Paperless-ngx v3 is required; connected server is not v3"
+            | "Paperless API v10 is not supported"
+            | "processing is restricted to tagged documents but no trigger tag is selected"
+            | "trigger tag IDs must be positive integers"
+            | "processed tag ID must be a positive integer"
+    ) || message.starts_with("Paperless API v10 is required; server selected v")
+        || message.starts_with("configured trigger tag ")
+            && message.ends_with(" no longer exists in Paperless")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeJobFailureContext {
+    pub code: String,
+    pub message: String,
+    pub upstream_status: Option<u16>,
+}
+
+/// Convert persisted job diagnostics into a fixed, browser-safe explanation.
+///
+/// `error_message` may have been written by an older release, so it is used
+/// only to recognize fixed failure shapes and an HTTP status. Arbitrary stored
+/// text is never returned to the browser.
+pub fn safe_job_failure_context(
+    job_error_code: Option<&str>,
+    provider_error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> Option<SafeJobFailureContext> {
+    let lower = error_message.unwrap_or_default().to_ascii_lowercase();
+    let inferred = if lower.contains("pagination attempted to leave the configured origin") {
+        Some("paperless_pagination_origin")
+    } else if lower.contains("paperless authentication failed") {
+        Some("paperless_authentication")
+    } else if lower.contains("paperless api permissions are insufficient") {
+        Some("paperless_forbidden")
+    } else if lower.contains("paperless object not found") {
+        Some("paperless_not_found")
+    } else if lower.contains("paperless request timed out")
+        || lower.contains("could not connect to paperless")
+        || lower.contains("paperless request failed")
+    {
+        Some("paperless_transport")
+    } else if lower.contains("paperless returned") && lower.contains("http ") {
+        Some("paperless_http_error")
+    } else if lower.contains("paperless") {
+        Some("paperless_error")
+    } else if lower.contains("provider") && lower.contains("http ") {
+        Some("provider_remote")
+    } else if lower.contains("provider") && lower.contains("timed out") {
+        Some("provider_transport")
+    } else if lower.contains("request validation failed") {
+        Some("validation_failed")
+    } else if lower.contains("invalid structured output")
+        || lower.contains("invalid analysis fields")
+    {
+        Some("invalid_structured_output")
+    } else {
+        None
+    };
+    let job_code = job_error_code.and_then(safe_diagnostic_code);
+    // A terminal job code describes the failure that actually ended the job.
+    // The latest usage event may belong to an earlier analysis attempt (for
+    // example when a repair token-count preflight fails), so it must not
+    // override a specific terminal category. Older releases persisted only
+    // coarse job codes; retain the more useful inferred/attempt category for
+    // those legacy rows.
+    let terminal_code = job_code.filter(|code| {
+        !matches!(
+            *code,
+            "analysis_failed" | "provider_error" | "upstream_error"
+        )
+    });
+    let code = terminal_code
+        .or(inferred.and_then(safe_diagnostic_code))
+        .or_else(|| provider_error_code.and_then(safe_diagnostic_code))
+        .or(job_code)
+        .or_else(|| error_message.map(|_| "analysis_failed"))?;
+    let upstream_status = match code {
+        "paperless_authentication" => Some(401),
+        "paperless_forbidden" => Some(403),
+        "paperless_not_found" => Some(404),
+        "paperless_http_error" | "provider_remote" => http_status_from_text(&lower),
+        _ => None,
+    };
+    let timed_out =
+        matches!(code, "paperless_transport" | "provider_transport") && lower.contains("timed out");
+    let (_, detail) = safe_error_detail(code, timed_out)?;
+    let message = match (code, upstream_status) {
+        ("paperless_http_error", Some(status)) => format!("Paperless returned HTTP {status}."),
+        ("provider_remote", Some(status)) => format!("The AI provider returned HTTP {status}."),
+        _ => detail.to_owned(),
+    };
+    Some(SafeJobFailureContext {
+        code: code.to_owned(),
+        message,
+        upstream_status,
+    })
 }
 
 /// Strip terminal control codes and aggressively remove values that could be
@@ -877,6 +1037,15 @@ fn safe_operational_fields(payload: &str) -> BTreeMap<String, String> {
         }
     }
 
+    if let Some(value) =
+        raw_field_value(payload, "upstream_status").filter(|value| is_http_status(value))
+    {
+        fields.insert("upstream_status".to_owned(), value.to_owned());
+    }
+    if let Some(value) = raw_field_value(payload, "timed_out").and_then(safe_boolean) {
+        fields.insert("timed_out".to_owned(), value.to_owned());
+    }
+
     if let Some(value) = raw_field_value(payload, "job_id").filter(|value| is_uuid(value)) {
         fields.insert("job_id".to_owned(), value.to_ascii_lowercase());
     }
@@ -897,13 +1066,16 @@ fn safe_operational_fields(payload: &str) -> BTreeMap<String, String> {
     if let Some(value) = raw_field_value(payload, "provider").and_then(safe_provider) {
         fields.insert("provider".to_owned(), value.to_owned());
     }
+    if let Some(value) = raw_field_value(payload, "api_family").and_then(safe_api_family) {
+        fields.insert("api_family".to_owned(), value.to_owned());
+    }
     if let Some(value) = raw_field_value(payload, "operation").and_then(safe_operation) {
         fields.insert("operation".to_owned(), value.to_owned());
     }
     if let Some(value) = raw_field_value(payload, "trigger").and_then(safe_trigger) {
         fields.insert("trigger".to_owned(), value.to_owned());
     }
-    if let Some(value) = raw_field_value(payload, "error_code").filter(|value| safe_slug(value)) {
+    if let Some(value) = raw_field_value(payload, "error_code").and_then(safe_diagnostic_code) {
         fields.insert("error_code".to_owned(), value.to_owned());
     }
     if let Some(address) =
@@ -958,6 +1130,20 @@ fn is_decimal(value: &str) -> bool {
     !value.is_empty() && value.len() <= 20 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn is_http_status(value: &str) -> bool {
+    value.len() == 3
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(value.parse::<u16>(), Ok(100..=599))
+}
+
+fn http_status_from_text(value: &str) -> Option<u16> {
+    value
+        .split_once("http ")
+        .and_then(|(_, tail)| tail.get(..3))
+        .filter(|status| is_http_status(status))
+        .and_then(|status| status.parse().ok())
+}
+
 fn is_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
@@ -969,12 +1155,11 @@ fn is_uuid(value: &str) -> bool {
         })
 }
 
-fn safe_slug(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 48
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+fn safe_boolean(value: &str) -> Option<&str> {
+    match value {
+        "true" | "false" => Some(value),
+        _ => None,
+    }
 }
 
 fn safe_status(value: &str) -> Option<&str> {
@@ -993,6 +1178,51 @@ fn safe_provider(value: &str) -> Option<&str> {
         | "google" | "unknown" => Some(value),
         _ => None,
     }
+}
+
+fn safe_api_family(value: &str) -> Option<&str> {
+    match value {
+        "responses" | "chat_completions" | "messages" => Some(value),
+        _ => None,
+    }
+}
+
+const SAFE_DIAGNOSTIC_CODES: &[&str] = &[
+    "analysis_failed",
+    "apply_failed",
+    "authentication_required",
+    "budget_exhausted",
+    "conflict",
+    "database_error",
+    "forbidden",
+    "internal_error",
+    "invalid_structured_output",
+    "io_error",
+    "migration_error",
+    "not_found",
+    "paperless_authentication",
+    "paperless_configuration",
+    "paperless_error",
+    "paperless_forbidden",
+    "paperless_http_error",
+    "paperless_not_found",
+    "paperless_pagination_origin",
+    "paperless_transport",
+    "provider_configuration",
+    "provider_error",
+    "provider_http_error",
+    "provider_remote",
+    "provider_transport",
+    "serialization_error",
+    "upstream_error",
+    "url_error",
+    "validation_failed",
+    "worker_paused",
+    "worker_unavailable",
+];
+
+fn safe_diagnostic_code(value: &str) -> Option<&str> {
+    SAFE_DIAGNOSTIC_CODES.contains(&value).then_some(value)
 }
 
 fn safe_operation(value: &str) -> Option<&str> {
@@ -1033,7 +1263,11 @@ pub(crate) fn safe_request_path(value: &str) -> Option<&'static str> {
 
 fn add_safe_error_context(payload: &str, fields: &mut BTreeMap<String, String>) {
     let lower = payload.to_ascii_lowercase();
-    let context = if lower.contains("pagination attempted to leave the configured origin") {
+    let timed_out = fields.get("timed_out").is_some_and(|value| value == "true");
+    let context = fields
+        .get("error_code")
+        .and_then(|code| safe_error_detail(code, timed_out))
+        .or_else(|| if lower.contains("pagination attempted to leave the configured origin") {
         Some((
             "paperless_pagination_origin",
             "Paperless pagination was rejected because its next-page URL left the configured server origin.",
@@ -1072,24 +1306,128 @@ fn add_safe_error_context(payload: &str, fields: &mut BTreeMap<String, String>) 
         ))
     } else {
         None
-    };
+    })
+    .map(|(code, detail)| (code.to_owned(), detail));
     if let Some((code, detail)) = context {
         fields
             .entry("error_code".to_owned())
-            .or_insert_with(|| code.to_owned());
+            .or_insert_with(|| code.clone());
         fields.insert("detail".to_owned(), detail.to_owned());
-        if matches!(code, "paperless_http_error" | "provider_http_error")
+        if matches!(
+            code.as_str(),
+            "paperless_http_error" | "provider_http_error" | "provider_remote"
+        ) && !fields.contains_key("upstream_status")
             && let Some(status) = lower
                 .split_once("http ")
                 .and_then(|(_, tail)| tail.get(..3))
-                .filter(|status| {
-                    status.bytes().all(|byte| byte.is_ascii_digit())
-                        && matches!(status.parse::<u16>(), Ok(100..=599))
-                })
+                .filter(|status| is_http_status(status))
         {
             fields.insert("upstream_status".to_owned(), status.to_owned());
         }
     }
+}
+
+fn safe_error_detail(code: &str, timed_out: bool) -> Option<(&str, &'static str)> {
+    Some(match code {
+        "analysis_failed" => (
+            "analysis_failed",
+            "Document analysis failed before a valid result could be applied.",
+        ),
+        "apply_failed" => (
+            "apply_failed",
+            "The analyzed metadata could not be applied to Paperless.",
+        ),
+        "authentication_required" => (
+            "authentication_required",
+            "Authentication was required for this operation.",
+        ),
+        "budget_exhausted" => (
+            "budget_exhausted",
+            "The configured token budget prevented this operation.",
+        ),
+        "conflict" => (
+            "conflict",
+            "This operation could not continue because its state conflicts with another action.",
+        ),
+        "forbidden" => ("forbidden", "This operation is not permitted."),
+        "internal_error"
+        | "database_error"
+        | "io_error"
+        | "migration_error"
+        | "serialization_error"
+        | "url_error" => (
+            code,
+            "An internal operation failed; no internal details were exposed.",
+        ),
+        "invalid_structured_output" => (
+            "invalid_structured_output",
+            "The AI provider output did not match the required structured format.",
+        ),
+        "not_found" => (
+            "not_found",
+            "The requested PaperlessLLM item was not found.",
+        ),
+        "paperless_authentication" => (
+            "paperless_authentication",
+            "Paperless rejected the configured API token. Check or replace the token in Settings.",
+        ),
+        "paperless_configuration" => (
+            "paperless_configuration",
+            "Paperless is not fully configured. Check its server URL, API token, custom CA certificate, and compatibility test.",
+        ),
+        "paperless_error" => ("paperless_error", "The Paperless API request failed."),
+        "paperless_forbidden" => (
+            "paperless_forbidden",
+            "Paperless rejected this API operation. Check the API user's permissions.",
+        ),
+        "paperless_http_error" => (
+            "paperless_http_error",
+            "Paperless returned an unsuccessful HTTP response.",
+        ),
+        "paperless_not_found" => (
+            "paperless_not_found",
+            "The Paperless document or metadata object no longer exists.",
+        ),
+        "paperless_pagination_origin" => (
+            "paperless_pagination_origin",
+            "Paperless pagination was rejected because its next-page URL left the configured server origin.",
+        ),
+        "paperless_transport" if timed_out => (
+            "paperless_transport",
+            "The Paperless request timed out before a response was confirmed.",
+        ),
+        "paperless_transport" => (
+            "paperless_transport",
+            "PaperlessLLM could not reach the configured Paperless server.",
+        ),
+        "provider_configuration" => (
+            "provider_configuration",
+            "The AI provider configuration was rejected. Check its URL, credentials, model, and capability test.",
+        ),
+        "provider_remote" | "provider_http_error" => (
+            code,
+            "The AI provider returned an unsuccessful HTTP response.",
+        ),
+        "provider_transport" if timed_out => (
+            "provider_transport",
+            "The AI provider request timed out before a response was confirmed.",
+        ),
+        "provider_transport" => (
+            "provider_transport",
+            "PaperlessLLM could not reach the AI provider.",
+        ),
+        "provider_error" | "upstream_error" => (code, "The upstream AI provider request failed."),
+        "validation_failed" => (
+            "validation_failed",
+            "AI request preflight failed. Check document file input, token limits, the selected model, and processing settings.",
+        ),
+        "worker_paused" => ("worker_paused", "The processing worker is paused."),
+        "worker_unavailable" => (
+            "worker_unavailable",
+            "The processing worker was unavailable.",
+        ),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1484,12 +1822,181 @@ mod tests {
             safe_error_code(&AppError::Upstream(
                 "provider analysis failed with HTTP 400: private response".to_owned()
             )),
-            "provider_error"
+            "provider_remote"
+        );
+        assert_eq!(
+            safe_error_code(&AppError::Upstream(
+                "provider repair request failed".to_owned()
+            )),
+            "provider_transport"
+        );
+        assert_eq!(
+            safe_error_code(&AppError::Validation(
+                "provider configuration failed".to_owned()
+            )),
+            "provider_configuration"
         );
         assert_eq!(
             safe_error_code(&AppError::Internal("/private/path sk-secret".to_owned())),
             "internal_error"
         );
+    }
+
+    #[test]
+    fn every_persisted_allowlisted_failure_code_has_a_safe_detail() {
+        for code in SAFE_DIAGNOSTIC_CODES {
+            let (mapped_code, detail) = safe_error_detail(code, false)
+                .unwrap_or_else(|| panic!("allowlisted diagnostic code {code} has no detail"));
+            assert_eq!(mapped_code, *code, "detail changed diagnostic code");
+            assert!(
+                !detail.trim().is_empty(),
+                "detail must not be empty for {code}"
+            );
+
+            let context = safe_job_failure_context(Some(code), None, None)
+                .unwrap_or_else(|| panic!("persisted diagnostic code {code} was dropped"));
+            assert_eq!(context.code, *code);
+            assert_eq!(context.message, detail);
+        }
+    }
+
+    #[test]
+    fn paperless_failures_do_not_become_ai_preflight_failures() {
+        let cases = [
+            (
+                AppError::NotFound("Paperless connection not found".to_owned()),
+                "paperless_configuration",
+            ),
+            (
+                AppError::Validation("Paperless API token is not configured".to_owned()),
+                "paperless_configuration",
+            ),
+            (
+                AppError::NotFound("Paperless object not found".to_owned()),
+                "paperless_not_found",
+            ),
+            (
+                AppError::Upstream("Paperless authentication failed".to_owned()),
+                "paperless_authentication",
+            ),
+            (
+                AppError::Upstream("Paperless API permissions are insufficient".to_owned()),
+                "paperless_forbidden",
+            ),
+            (
+                AppError::Upstream("Could not connect to Paperless".to_owned()),
+                "paperless_transport",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(safe_error_code(&error), expected);
+        }
+        assert_eq!(
+            safe_error_code(&AppError::NotFound("job not found".to_owned())),
+            "not_found"
+        );
+        assert_eq!(
+            safe_error_code(&AppError::Validation(
+                "document file exceeds the configured limit".to_owned()
+            )),
+            "validation_failed"
+        );
+    }
+
+    #[test]
+    fn persisted_job_failures_become_actionable_without_returning_stored_text() {
+        let provider = safe_job_failure_context(
+            Some("analysis_failed"),
+            Some("provider_remote"),
+            Some(
+                "Provider request failed with HTTP 401: api_key=sk-private prompt=private OCR text",
+            ),
+        )
+        .unwrap();
+        assert_eq!(provider.code, "provider_remote");
+        assert_eq!(provider.upstream_status, Some(401));
+        assert_eq!(provider.message, "The AI provider returned HTTP 401.");
+
+        let internal = safe_job_failure_context(
+            Some("internal_error"),
+            None,
+            Some("database path /private/path contained private document text"),
+        )
+        .unwrap();
+        assert_eq!(internal.code, "internal_error");
+        assert_eq!(
+            internal.message,
+            "An internal operation failed; no internal details were exposed."
+        );
+
+        let serialized = format!("{provider:?} {internal:?}");
+        assert!(!serialized.contains("sk-private"));
+        assert!(!serialized.contains("private OCR"));
+        assert!(!serialized.contains("/private/path"));
+        assert!(!serialized.contains("private document text"));
+
+        let preflight = safe_job_failure_context(
+            Some("analysis_failed"),
+            None,
+            Some("request validation failed"),
+        )
+        .unwrap();
+        assert_eq!(preflight.code, "validation_failed");
+        assert!(preflight.message.contains("request preflight"));
+        assert!(preflight.message.contains("document file input"));
+
+        let repair_preflight = safe_job_failure_context(
+            Some("validation_failed"),
+            Some("invalid_structured_output"),
+            Some("request validation failed"),
+        )
+        .unwrap();
+        assert_eq!(repair_preflight.code, "validation_failed");
+        assert!(repair_preflight.upstream_status.is_none());
+
+        let provider_configuration = safe_job_failure_context(
+            Some("provider_configuration"),
+            Some("invalid_structured_output"),
+            Some("request validation failed"),
+        )
+        .unwrap();
+        assert_eq!(provider_configuration.code, "provider_configuration");
+        assert_eq!(
+            provider_configuration.message,
+            "The AI provider configuration was rejected. Check its URL, credentials, model, and capability test."
+        );
+
+        let paperless_authentication = safe_job_failure_context(
+            Some("analysis_failed"),
+            None,
+            Some("Paperless authentication failed: api_key=secret document OCR"),
+        )
+        .unwrap();
+        assert_eq!(paperless_authentication.code, "paperless_authentication");
+        assert_eq!(paperless_authentication.upstream_status, Some(401));
+        assert_eq!(
+            paperless_authentication.message,
+            "Paperless rejected the configured API token. Check or replace the token in Settings."
+        );
+
+        let paperless_timeout = safe_job_failure_context(
+            Some("analysis_failed"),
+            None,
+            Some("Paperless request timed out: /private/path sk-secret OCR text"),
+        )
+        .unwrap();
+        assert_eq!(paperless_timeout.code, "paperless_transport");
+        assert_eq!(
+            paperless_timeout.message,
+            "The Paperless request timed out before a response was confirmed."
+        );
+
+        let paperless_serialized = format!("{paperless_authentication:?} {paperless_timeout:?}");
+        assert!(!paperless_serialized.contains("api_key"));
+        assert!(!paperless_serialized.contains("OCR"));
+        assert!(!paperless_serialized.contains("/private/path"));
+        assert!(!paperless_serialized.contains("sk-secret"));
     }
 
     #[test]
@@ -1599,6 +2106,55 @@ mod tests {
         assert!(!serialized.contains("model"));
         assert!(!serialized.contains("title"));
         assert!(!serialized.contains("prompt"));
+    }
+
+    #[test]
+    fn provider_failures_keep_safe_transport_diagnostics_and_drop_raw_context() {
+        let entry = sanitize_log_entry(concat!(
+            "2026-08-01T10:00:00Z WARN provider request failed ",
+            "event=\"provider.request_failed\" target=\"provider\" ",
+            "job_id=01234567-89ab-cdef-0123-456789abcdef document_id=17 attempt=2 ",
+            "provider=openai api_family=responses operation=repair status=failed ",
+            "error_code=provider_remote upstream_status=401 timed_out=false latency_ms=42 ",
+            "model=private-model response_body=private-body prompt=private-document"
+        ))
+        .unwrap();
+
+        assert_eq!(entry.event, "provider.request_failed");
+        assert_eq!(
+            entry.fields.get("status").map(String::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            entry.fields.get("api_family").map(String::as_str),
+            Some("responses")
+        );
+        assert_eq!(
+            entry.fields.get("error_code").map(String::as_str),
+            Some("provider_remote")
+        );
+        assert_eq!(
+            entry.fields.get("upstream_status").map(String::as_str),
+            Some("401")
+        );
+        assert_eq!(
+            entry.fields.get("detail").map(String::as_str),
+            Some("The AI provider returned an unsuccessful HTTP response.")
+        );
+        let serialized = serde_json::to_string(&entry).unwrap();
+        assert!(!serialized.contains("private-model"));
+        assert!(!serialized.contains("private-body"));
+        assert!(!serialized.contains("private-document"));
+        assert!(!serialized.contains("response_body"));
+        assert!(!serialized.contains("prompt"));
+
+        let hostile = sanitize_log_entry(concat!(
+            "2026-08-01T10:00:01Z WARN provider request failed ",
+            "event=\"provider.request_failed\" error_code=attacker_controlled ",
+            "api_family=private_family upstream_status=999 timed_out=maybe"
+        ))
+        .unwrap();
+        assert!(hostile.fields.is_empty());
     }
 
     #[test]

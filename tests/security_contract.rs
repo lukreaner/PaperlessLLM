@@ -558,6 +558,14 @@ async fn serve_process_returns_the_shutdown_body_before_exiting_successfully() {
         .await
         .expect("reach ephemeral listener");
     assert!(health.status().is_success());
+    let health_body = health
+        .json::<Value>()
+        .await
+        .expect("read health response body");
+    assert_eq!(
+        health_body.get("build_id").and_then(Value::as_str),
+        Some(paperless_llm::BUILD_ID)
+    );
 
     let response = client
         .post(format!("{base_url}/api/shutdown"))

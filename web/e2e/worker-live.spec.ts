@@ -20,6 +20,7 @@ test("live activity updates and safely controls the waiting queue", async ({ pag
     last_scan_at: now,
     next_scan_at: paused ? undefined : now,
     active_job_id: "active-job",
+    active_job_ids: ["active-job", "active-job-2"],
     active_job: {
       id: "active-job",
       document_id: 41,
@@ -27,16 +28,32 @@ test("live activity updates and safely controls the waiting queue", async ({ pag
       state: "analyzing" as const,
       updated_at: now,
     },
+    active_jobs: [
+      {
+        id: "active-job",
+        document_id: 41,
+        document_title: activeTitle,
+        state: "analyzing" as const,
+        updated_at: now,
+      },
+      {
+        id: "active-job-2",
+        document_id: 42,
+        document_title: "Bank statement",
+        state: "analyzing" as const,
+        updated_at: now,
+      },
+    ],
   });
   const status = (): AppStatus => ({
-    version: "0.1.0",
+    version: "0.1.1",
     setup_required: false,
     worker: worker(),
     paperless: { state: "connected", message: "Paperless connected" },
     provider: { state: "connected", message: "Provider connected" },
     queue: {
       queued: queuedState === "queued" ? 1 : 0,
-      analyzing: 1,
+      analyzing: 2,
       awaiting_review: 0,
       applying: 0,
       completed: 0,
@@ -108,17 +125,20 @@ test("live activity updates and safely controls the waiting queue", async ({ pag
   });
 
   await page.goto("/");
-  await expect(page.getByText("Incoming invoice")).toBeVisible();
+  await expect(page.getByText("2 documents in parallel", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 active", { exact: true })).toBeVisible();
+  await expect(page.getByText("Incoming invoice", { exact: true })).toBeVisible();
+  await expect(page.getByText("Bank statement", { exact: true })).toBeVisible();
 
   activeTitle = "Updated live invoice";
-  await expect(page.getByText("Updated live invoice")).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText("Updated live invoice", { exact: true })).toBeVisible({ timeout: 5_000 });
 
   await page.getByRole("button", { name: "Pause processing" }).click();
   await expect(page.getByText("Pausing safely")).toBeVisible();
   await expect(page.getByRole("button", { name: "Continue processing" })).toBeVisible();
 
   await page.getByRole("link", { name: "Activity", exact: true }).click();
-  await expect(page.getByText("Updated live invoice")).toBeVisible();
+  await expect(page.locator(".live-worker small")).toContainText("Updated live invoice");
   await page.getByRole("button", { name: "Next" }).click();
   await expect(page.getByText("Showing 21–21 of 21")).toBeVisible();
   await page.getByRole("button", { name: "Show job details" }).click();

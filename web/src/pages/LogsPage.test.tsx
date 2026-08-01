@@ -12,6 +12,7 @@ afterEach(() => {
 const worker: DiagnosticLogs["worker"] = {
   state: "running",
   active: false,
+  active_count: 0,
   last_scan_at: "2026-08-01T10:01:00Z",
   next_scan_at: "2026-08-01T10:06:00Z",
 };
@@ -80,6 +81,43 @@ describe("LogsPage", () => {
     expect(screen.queryByText("Service · Ready")).not.toBeInTheDocument();
   });
 
+  it("renders safe provider failure dimensions with readable labels", async () => {
+    vi.spyOn(api, "logs").mockResolvedValue({
+      available: true,
+      entries: [{
+        timestamp: "2026-08-01T10:02:00Z",
+        level: "WARN",
+        event: "provider.request_failed",
+        target: "provider",
+        fields: {
+          provider: "openai",
+          api_family: "responses",
+          operation: "analysis",
+          attempt: "1",
+          status: "failed",
+          latency_ms: "321",
+          error_code: "provider_remote",
+          upstream_status: "429",
+          timed_out: "false",
+          detail: "The AI provider returned an unsuccessful HTTP response.",
+        },
+      }],
+      truncated: false,
+      worker,
+    });
+    render(<LogsPage />);
+
+    expect(await screen.findByText("Provider · Request · Failed")).toBeInTheDocument();
+    expect(screen.getByText("API family")).toBeInTheDocument();
+    expect(screen.getByText("Responses API")).toBeInTheDocument();
+    expect(screen.getByText("Error class")).toBeInTheDocument();
+    expect(screen.getByText("provider_remote")).toBeInTheDocument();
+    expect(screen.getByText("Upstream HTTP")).toBeInTheDocument();
+    expect(screen.getByText("429")).toBeInTheDocument();
+    expect(screen.getByText("Timed out")).toBeInTheDocument();
+    expect(screen.getByText("No")).toBeInTheDocument();
+  });
+
   it("polls while auto-refresh is enabled and stops when disabled", async () => {
     vi.useFakeTimers();
     const request = vi.spyOn(api, "logs").mockResolvedValue({
@@ -142,6 +180,30 @@ describe("LogsPage", () => {
     render(<LogsPage />);
 
     expect(await screen.findByText("Scanning Paperless · 12 discovered, 3 queued", { selector: ".diagnostic-worker strong" })).toBeInTheDocument();
+  });
+
+  it("reports concurrent active documents without exposing their identifiers", async () => {
+    vi.spyOn(api, "logs").mockResolvedValue({
+      available: true,
+      entries: [],
+      truncated: false,
+      worker: { ...worker, active: true, active_count: 3 },
+    });
+    render(<LogsPage />);
+
+    expect(await screen.findByText("Processing 3 documents", { selector: ".diagnostic-worker strong" })).toBeInTheDocument();
+  });
+
+  it("reports every in-flight document while pausing parallel work", async () => {
+    vi.spyOn(api, "logs").mockResolvedValue({
+      available: true,
+      entries: [],
+      truncated: false,
+      worker: { ...worker, state: "pausing", active: true, active_count: 3 },
+    });
+    render(<LogsPage />);
+
+    expect(await screen.findByText("Finishing 3 documents", { selector: ".diagnostic-worker strong" })).toBeInTheDocument();
   });
 
   it("keeps the last log data visible while background updates reconnect", async () => {

@@ -51,6 +51,10 @@ pub struct WorkerStatusDto {
     pub active_job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_job: Option<ActiveJobDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_job_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_jobs: Vec<ActiveJobDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_progress: Option<ScanProgressDto>,
 }
@@ -117,6 +121,9 @@ pub struct ProcessingSettings {
     /// sets an optional per-scan ceiling without changing the bounded API page
     /// size used by the Paperless client.
     pub max_documents_per_scan: Option<u64>,
+    /// Maximum number of documents that may be analyzed concurrently. The
+    /// default stays conservative for local models and provider rate limits.
+    pub inference_concurrency: u64,
     pub review_mode: bool,
     pub use_existing_correspondents_and_tags: bool,
     pub process_only_tagged: bool,
@@ -139,6 +146,7 @@ impl Default for ProcessingSettings {
         Self {
             poll_interval_minutes: 5,
             max_documents_per_scan: None,
+            inference_concurrency: 1,
             review_mode: false,
             use_existing_correspondents_and_tags: true,
             process_only_tagged: false,

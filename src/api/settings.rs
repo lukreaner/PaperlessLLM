@@ -29,6 +29,26 @@ pub async fn load_settings(state: &AppState) -> AppResult<AppSettings> {
         settings.paperless.api_token_configured =
             state.secrets.exists(&connection.token_secret_key).await?;
     }
+    // The processing profile is the worker's operational source of truth.
+    // Older dashboard snapshots can still contain the original 50-document
+    // default even after migration 0003 changed the profile to unlimited; if
+    // returned unchanged, the next unrelated Settings save would restore the
+    // obsolete cap. Hydrating these live controls also keeps the Review-mode
+    // indicator and parallelism control aligned with what the worker enforces.
+    let operational: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT automatic_mode,max_documents_per_scan,concurrency \
+         FROM processing_profiles WHERE enabled=1 ORDER BY updated_at DESC LIMIT 1",
+    )
+    .fetch_optional(state.database.pool())
+    .await?;
+    if let Some((mode, document_limit, concurrency)) = operational {
+        settings.processing.review_mode = mode == "review";
+        settings.processing.max_documents_per_scan = u64::try_from(document_limit)
+            .ok()
+            .filter(|limit| *limit > 0);
+        settings.processing.inference_concurrency =
+            u64::try_from(concurrency).unwrap_or(1).clamp(1, 8);
+    }
     if settings.active_provider_id.is_none() {
         settings.active_provider_id = sqlx::query_scalar(
             "SELECT provider_profile_id FROM processing_profiles WHERE enabled=1 LIMIT 1",
@@ -75,13 +95,19 @@ pub async fn save_settings(state: &AppState, mut settings: AppSettings) -> AppRe
     settings.paperless.api_token_configured = has_token;
 
     if !settings.paperless.base_url.trim().is_empty() {
+        settings.paperless.base_url = settings
+            .paperless
+            .base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
         sqlx::query(
             "INSERT INTO paperless_connections(id, name, base_url, token_secret_key, custom_ca_pem, updated_at) \
              VALUES(?, 'Paperless-ngx', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
              ON CONFLICT(id) DO UPDATE SET base_url=excluded.base_url, token_secret_key=excluded.token_secret_key, custom_ca_pem=excluded.custom_ca_pem, updated_at=excluded.updated_at",
         )
         .bind(CONNECTION_ID)
-        .bind(settings.paperless.base_url.trim().trim_end_matches('/'))
+        .bind(&settings.paperless.base_url)
         .bind(PAPERLESS_TOKEN_KEY)
         .bind(settings.paperless.custom_ca_pem.as_deref().filter(|pem| !pem.trim().is_empty()))
         .execute(state.database.pool())
@@ -99,7 +125,7 @@ pub async fn save_settings(state: &AppState, mut settings: AppSettings) -> AppRe
         .await?;
     }
 
-    if let Some(provider_id) = settings.active_provider_id.as_deref() {
+    let provider = if let Some(provider_id) = settings.active_provider_id.as_deref() {
         let provider: Option<ProviderProfileRecord> =
             sqlx::query_as("SELECT * FROM provider_profiles WHERE id=? AND enabled=1")
                 .bind(provider_id)
@@ -115,32 +141,126 @@ pub async fn save_settings(state: &AppState, mut settings: AppSettings) -> AppRe
                 "a Paperless URL and API token are required before setup can finish".to_owned(),
             ));
         }
-        let provider = provider.expect("checked above");
-        sqlx::query("UPDATE provider_profiles SET max_output_tokens=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?")
-            .bind(settings.limits.max_output_tokens as i64)
-            .bind(provider_id)
-            .execute(state.database.pool())
-            .await?;
-        upsert_processing_profile(state, &settings, &provider).await?;
-        sync_custom_field_rules(state, &settings).await?;
-    }
+        Some(provider.expect("checked above"))
+    } else {
+        None
+    };
 
     let mut persisted = settings.clone();
     persisted.redact_secrets();
-    state
-        .database
-        .set_setting(ACTIVE_PROVIDER_SETTING_KEY, &persisted.active_provider_id)
+    let active_provider_json = serde_json::to_string(&persisted.active_provider_id)?;
+    let settings_json = serde_json::to_string(&persisted)?;
+    if let Some(provider) = provider.as_ref() {
+        let prepared_rules = prepare_custom_field_rules(state, &settings).await?;
+        persist_processing_settings(
+            state,
+            &settings,
+            provider,
+            &prepared_rules,
+            &active_provider_json,
+            &settings_json,
+        )
         .await?;
-    state.database.set_setting(SETTINGS_KEY, &persisted).await?;
+    } else {
+        let mut transaction = state.database.pool().begin().await?;
+        set_setting_json(
+            &mut transaction,
+            ACTIVE_PROVIDER_SETTING_KEY,
+            &active_provider_json,
+        )
+        .await?;
+        set_setting_json(&mut transaction, SETTINGS_KEY, &settings_json).await?;
+        transaction.commit().await?;
+    }
     state.set_configured_lan(persisted.security.lan_enabled);
     // Budget increases and other processing changes should wake durable
     // waiting work immediately. The notification is intentionally best-effort.
     state.worker.notify_state_changed();
-    load_settings(state).await
+    // All fallible persistence is complete before the processing-mode gate is
+    // released. Returning the already-redacted value avoids turning a
+    // successfully committed Review -> Automatic transition into an apparent
+    // API failure because of a separate read-back error.
+    Ok(persisted)
 }
 
+async fn persist_processing_settings(
+    state: &AppState,
+    settings: &AppSettings,
+    provider: &ProviderProfileRecord,
+    prepared_rules: &[PreparedCustomFieldRule],
+    active_provider_json: &str,
+    settings_json: &str,
+) -> AppResult<()> {
+    // This is the linearization boundary shared with automatic Paperless
+    // applies. Keep the database transaction wholly inside the gate: success
+    // makes the new mode visible before release, while every failure rolls it
+    // back before an automatic apply can inspect the mode.
+    let _apply_gate = state.worker.lock_apply_gate().await;
+    let mut connection = state.database.pool().acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await?;
+    let result = async {
+        sqlx::query("UPDATE provider_profiles SET max_output_tokens=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?")
+            .bind(settings.limits.max_output_tokens as i64)
+            .bind(&provider.id)
+            .execute(&mut *connection)
+            .await?;
+        upsert_processing_profile_on(&mut connection, settings, provider).await?;
+        sync_custom_field_rules_on(&mut connection, settings, prepared_rules).await?;
+        set_setting_json(
+            &mut connection,
+            ACTIVE_PROVIDER_SETTING_KEY,
+            active_provider_json,
+        )
+        .await?;
+        set_setting_json(&mut connection, SETTINGS_KEY, settings_json).await?;
+        AppResult::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok(())
+        }
+        Err(error) => {
+            sqlx::query("ROLLBACK")
+                .execute(&mut *connection)
+                .await
+                .map_err(AppError::from)?;
+            Err(error)
+        }
+    }
+}
+
+async fn set_setting_json(
+    connection: &mut sqlx::SqliteConnection,
+    key: &str,
+    value_json: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO app_settings(key, value_json, updated_at) VALUES(?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value_json)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn upsert_processing_profile(
     state: &AppState,
+    settings: &AppSettings,
+    provider: &ProviderProfileRecord,
+) -> AppResult<()> {
+    let mut connection = state.database.pool().acquire().await?;
+    upsert_processing_profile_on(&mut connection, settings, provider).await
+}
+
+async fn upsert_processing_profile_on(
+    connection: &mut sqlx::SqliteConnection,
     settings: &AppSettings,
     provider: &ProviderProfileRecord,
 ) -> AppResult<()> {
@@ -150,15 +270,15 @@ async fn upsert_processing_profile(
     sqlx::query(
         "INSERT INTO processing_profiles(\
             id,name,paperless_connection_id,provider_profile_id,enabled,automatic_mode,poll_interval_seconds,\
-            max_documents_per_scan,use_existing_data,process_pre_tagged_only,trigger_tag_ids_json,trigger_match_mode,\
+            max_documents_per_scan,concurrency,use_existing_data,process_pre_tagged_only,trigger_tag_ids_json,trigger_match_mode,\
             restrict_tags,restrict_correspondents,restrict_document_types,add_processed_tag,processed_tag_name,\
             tags_enabled,correspondent_enabled,document_type_enabled,title_enabled,custom_fields_enabled,\
             overwrite_tags,overwrite_correspondent,overwrite_document_type,overwrite_title,prompt_mode,custom_prompt,\
             max_input_tokens,include_document_file,file_rendition,max_file_bytes,max_file_pages,ocr_excerpt_tokens,\
             daily_budget_tokens,monthly_budget_tokens,budget_timezone,warning_threshold_percent,updated_at\
-         ) VALUES(?, 'Default', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+         ) VALUES(?, 'Default', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
          ON CONFLICT(id) DO UPDATE SET provider_profile_id=excluded.provider_profile_id,enabled=1,automatic_mode=excluded.automatic_mode,\
-            poll_interval_seconds=excluded.poll_interval_seconds,max_documents_per_scan=excluded.max_documents_per_scan,\
+            poll_interval_seconds=excluded.poll_interval_seconds,max_documents_per_scan=excluded.max_documents_per_scan,concurrency=excluded.concurrency,\
             use_existing_data=excluded.use_existing_data,process_pre_tagged_only=excluded.process_pre_tagged_only,\
             trigger_tag_ids_json=excluded.trigger_tag_ids_json,trigger_match_mode=excluded.trigger_match_mode,restrict_tags=excluded.restrict_tags,\
             restrict_correspondents=excluded.restrict_correspondents,restrict_document_types=excluded.restrict_document_types,add_processed_tag=excluded.add_processed_tag,\
@@ -177,6 +297,7 @@ async fn upsert_processing_profile(
     .bind(if processing.review_mode { "review" } else { "automatic" })
     .bind((processing.poll_interval_minutes * 60) as i64)
     .bind(processing.max_documents_per_scan.unwrap_or(0) as i64)
+    .bind(processing.inference_concurrency as i64)
     .bind(processing.use_existing_correspondents_and_tags)
     .bind(processing.process_only_tagged)
     .bind(serde_json::to_string(&processing.trigger_tag_ids)?)
@@ -207,19 +328,28 @@ async fn upsert_processing_profile(
     .bind(normalize_limit(limits.global_budget.monthly))
     .bind(&limits.reset_timezone)
     .bind(limits.warning_percent as i64)
-    .execute(state.database.pool())
+    .execute(&mut *connection)
     .await?;
     Ok(())
 }
 
-async fn sync_custom_field_rules(state: &AppState, settings: &AppSettings) -> AppResult<()> {
+#[derive(Debug)]
+struct PreparedCustomFieldRule {
+    id: String,
+    paperless_field_id: i64,
+    name: String,
+    data_type: String,
+    extra_data_json: String,
+    overwrite_existing: bool,
+}
+
+async fn prepare_custom_field_rules(
+    state: &AppState,
+    settings: &AppSettings,
+) -> AppResult<Vec<PreparedCustomFieldRule>> {
     let selected = &settings.processing.custom_field_ids;
     if selected.is_empty() {
-        sqlx::query("DELETE FROM custom_field_rules WHERE processing_profile_id=?")
-            .bind(PROCESSING_PROFILE_ID)
-            .execute(state.database.pool())
-            .await?;
-        return Ok(());
+        return Ok(Vec::new());
     }
     let cache = state
         .database
@@ -230,6 +360,7 @@ async fn sync_custom_field_rules(state: &AppState, settings: &AppSettings) -> Ap
             "load the Paperless custom-field catalog before selecting fields".to_owned(),
         ));
     };
+    let mut rules = Vec::with_capacity(selected.len());
     for id in selected {
         let field = cache
             .custom_fields
@@ -244,27 +375,54 @@ async fn sync_custom_field_rules(state: &AppState, settings: &AppSettings) -> Ap
                 "document-link custom fields are not supported in v1".to_owned(),
             ));
         }
+        rules.push(PreparedCustomFieldRule {
+            id: Uuid::new_v4().to_string(),
+            paperless_field_id: field.id,
+            name: field.name.clone(),
+            data_type: data_type.to_owned(),
+            extra_data_json: serde_json::to_string(
+                field.extra_data.as_ref().unwrap_or(&Value::Null),
+            )?,
+            overwrite_existing: settings.processing.overwrite.custom_fields,
+        });
+    }
+    Ok(rules)
+}
+
+async fn sync_custom_field_rules_on(
+    connection: &mut sqlx::SqliteConnection,
+    settings: &AppSettings,
+    rules: &[PreparedCustomFieldRule],
+) -> AppResult<()> {
+    if rules.is_empty() {
+        sqlx::query("DELETE FROM custom_field_rules WHERE processing_profile_id=?")
+            .bind(PROCESSING_PROFILE_ID)
+            .execute(&mut *connection)
+            .await?;
+        return Ok(());
+    }
+    for rule in rules {
         sqlx::query(
             "INSERT INTO custom_field_rules(id,processing_profile_id,paperless_field_id,name,data_type,extra_data_json,overwrite_existing,enabled) \
              VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(processing_profile_id,paperless_field_id) DO UPDATE SET name=excluded.name,data_type=excluded.data_type,extra_data_json=excluded.extra_data_json,overwrite_existing=excluded.overwrite_existing,enabled=1",
         )
-        .bind(Uuid::new_v4().to_string())
+        .bind(&rule.id)
         .bind(PROCESSING_PROFILE_ID)
-        .bind(field.id)
-        .bind(&field.name)
-        .bind(data_type)
-        .bind(serde_json::to_string(field.extra_data.as_ref().unwrap_or(&Value::Null))?)
-        .bind(settings.processing.overwrite.custom_fields)
-        .execute(state.database.pool())
+        .bind(rule.paperless_field_id)
+        .bind(&rule.name)
+        .bind(&rule.data_type)
+        .bind(&rule.extra_data_json)
+        .bind(rule.overwrite_existing)
+        .execute(&mut *connection)
         .await?;
     }
-    let selected_json = serde_json::to_string(selected)?;
+    let selected_json = serde_json::to_string(&settings.processing.custom_field_ids)?;
     sqlx::query(
         "DELETE FROM custom_field_rules WHERE processing_profile_id=? AND paperless_field_id NOT IN (SELECT value FROM json_each(?))",
     )
     .bind(PROCESSING_PROFILE_ID)
     .bind(selected_json)
-    .execute(state.database.pool())
+    .execute(&mut *connection)
     .await?;
     Ok(())
 }
@@ -308,6 +466,11 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
     {
         return Err(AppError::Validation(
             "maximum documents per scan must be between 1 and 1000000, or empty for all".to_owned(),
+        ));
+    }
+    if !(1..=8).contains(&settings.processing.inference_concurrency) {
+        return Err(AppError::Validation(
+            "parallel document analyses must be between 1 and 8".to_owned(),
         ));
     }
     if !matches!(settings.processing.trigger_match.as_str(), "any" | "all") {
@@ -426,10 +589,120 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.processing.poll_interval_minutes, 5);
         assert_eq!(settings.processing.max_documents_per_scan, None);
+        assert_eq!(settings.processing.inference_concurrency, 1);
         assert_eq!(settings.limits.max_input_tokens, 32_000);
         assert_eq!(settings.limits.max_output_tokens, 8_000);
         assert!(settings.processing.restrict_existing_tags);
         assert_eq!(settings.processing.processed_tag_name, "ai-processed");
+    }
+
+    #[test]
+    fn parallel_analysis_limit_is_bounded() {
+        let mut settings = AppSettings::default();
+        settings.processing.inference_concurrency = 0;
+        assert!(matches!(
+            validate_settings(&settings),
+            Err(AppError::Validation(_))
+        ));
+        settings.processing.inference_concurrency = 8;
+        assert!(validate_settings(&settings).is_ok());
+        settings.processing.inference_concurrency = 9;
+        assert!(matches!(
+            validate_settings(&settings),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_settings_fail_without_waiting_for_the_apply_gate() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = app::initialize(RuntimeOptions {
+            data_dir: directory.path().to_owned(),
+            bind: "127.0.0.1".parse().expect("loopback address"),
+            port: 0,
+            open_browser: false,
+        })
+        .await
+        .expect("application state");
+        let _apply_gate = state.worker.lock_apply_gate().await;
+        let mut settings = AppSettings::default();
+        settings.processing.inference_concurrency = 0;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            save_settings(&state, settings),
+        )
+        .await
+        .expect("validation must happen before waiting for the apply gate");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn failed_review_to_automatic_save_rolls_back_mode_and_releases_gate() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = app::initialize(RuntimeOptions {
+            data_dir: directory.path().to_owned(),
+            bind: "127.0.0.1".parse().expect("loopback address"),
+            port: 0,
+            open_browser: false,
+        })
+        .await
+        .expect("application state");
+        sqlx::query(
+            "INSERT INTO provider_profiles(id,name,provider_kind,base_url,model,api_family) \
+             VALUES('provider','Local','lmstudio','http://localhost:1234/v1','model','responses')",
+        )
+        .execute(state.database.pool())
+        .await
+        .expect("provider profile");
+
+        let mut settings = AppSettings::default();
+        settings.paperless.base_url = "http://localhost:8000".to_owned();
+        settings.paperless.api_token = Some("paperless-token".to_owned());
+        settings.active_provider_id = Some("provider".to_owned());
+        settings.processing.review_mode = true;
+        let mut settings = save_settings(&state, settings)
+            .await
+            .expect("initial review settings");
+
+        // Fail after processing_profiles has been upserted inside the save
+        // transaction. The transaction must restore Review mode before the
+        // apply gate becomes available to a waiting worker.
+        sqlx::raw_sql(
+            "CREATE TRIGGER fail_dashboard_settings_update \
+             BEFORE UPDATE ON app_settings \
+             WHEN NEW.key='dashboard_settings' \
+             BEGIN SELECT RAISE(ABORT, 'synthetic post-upsert failure'); END;",
+        )
+        .execute(state.database.pool())
+        .await
+        .expect("failure trigger");
+        settings.processing.review_mode = false;
+        let error = save_settings(&state, settings)
+            .await
+            .expect_err("automatic-mode save must fail");
+        assert!(matches!(error, AppError::Database(_)));
+
+        let mode: String =
+            sqlx::query_scalar("SELECT automatic_mode FROM processing_profiles WHERE id='default'")
+                .fetch_one(state.database.pool())
+                .await
+                .expect("persisted processing mode");
+        assert_eq!(mode, "review");
+        let stored: AppSettings = state
+            .database
+            .get_setting(SETTINGS_KEY)
+            .await
+            .expect("stored settings")
+            .expect("dashboard settings");
+        assert!(stored.processing.review_mode);
+
+        let _gate = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.worker.lock_apply_gate(),
+        )
+        .await
+        .expect("failed save must release the apply gate");
     }
 
     #[tokio::test]
@@ -480,6 +753,7 @@ mod tests {
         assert_eq!(unlimited, 0);
 
         settings.processing.max_documents_per_scan = Some(2_500);
+        settings.processing.inference_concurrency = 4;
         upsert_processing_profile(&state, &settings, &provider)
             .await
             .expect("save capped discovery profile");
@@ -490,6 +764,53 @@ mod tests {
                 .await
                 .expect("capped scan setting");
         assert_eq!(capped, 2_500);
+        let concurrency: i64 =
+            sqlx::query_scalar("SELECT concurrency FROM processing_profiles WHERE id=?")
+                .bind(PROCESSING_PROFILE_ID)
+                .fetch_one(state.database.pool())
+                .await
+                .expect("parallel-analysis setting");
+        assert_eq!(concurrency, 4);
+    }
+
+    #[tokio::test]
+    async fn operational_profile_overrides_a_stale_legacy_dashboard_snapshot() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state = app::initialize(RuntimeOptions {
+            data_dir: directory.path().to_owned(),
+            bind: "127.0.0.1".parse().expect("loopback address"),
+            port: 0,
+            open_browser: false,
+        })
+        .await
+        .expect("application state");
+        sqlx::query(
+            "INSERT INTO paperless_connections(id,name,base_url,token_secret_key) \
+             VALUES('default','Paperless','http://localhost:8000','paperless:default:token'); \
+             INSERT INTO provider_profiles(id,name,provider_kind,base_url,model,api_family) \
+             VALUES('provider','Local','lmstudio','http://localhost:1234/v1','model','responses'); \
+             INSERT INTO processing_profiles( \
+                 id,name,paperless_connection_id,provider_profile_id,enabled,automatic_mode,max_documents_per_scan,concurrency \
+             ) VALUES('default','Default','default','provider',1,'review',0,4)",
+        )
+        .execute(state.database.pool())
+        .await
+        .expect("operational profile");
+
+        let mut stale = AppSettings::default();
+        stale.processing.review_mode = false;
+        stale.processing.max_documents_per_scan = Some(50);
+        stale.processing.inference_concurrency = 1;
+        state
+            .database
+            .set_setting(SETTINGS_KEY, &stale)
+            .await
+            .expect("legacy dashboard snapshot");
+
+        let loaded = load_settings(&state).await.expect("loaded settings");
+        assert!(loaded.processing.review_mode);
+        assert_eq!(loaded.processing.max_documents_per_scan, None);
+        assert_eq!(loaded.processing.inference_concurrency, 4);
     }
 
     #[tokio::test]

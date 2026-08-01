@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api } from "../api/client";
-import type { Job, JobState } from "../api/types";
+import type { ActiveJob, Job, JobState } from "../api/types";
 import { useApp } from "../App";
 import { useToast } from "../components/Toast";
 import { Badge, Button, Card, ErrorState, PageHeader, ProgressBar, Skeleton, StatusDot } from "../components/UI";
@@ -45,6 +45,26 @@ export function OverviewPage() {
   const dailyPercent = daily ? budgetPercent(daily.daily_used, daily.daily_limit) : 0;
   const activeProvider = providers.find((provider) => provider.id === settings.active_provider_id || provider.active);
   const paused = status.worker.paused || status.worker.state === "paused";
+  const activeJobs = status.worker.active_jobs?.length ? status.worker.active_jobs : status.worker.active_job ? [status.worker.active_job] : [];
+  const activeJobCount = activeJobs.length;
+  const activeQueueDetail = activeJobCount > 1
+    ? `${paused ? "Finishing" : "Working on"} ${activeJobCount} documents in parallel`
+    : activeJobs[0]
+      ? `${paused ? "Finishing" : "Working on"} document #${activeJobs[0].document_id}`
+      : status.worker.scan_progress
+        ? `${paused ? "Finishing scan" : "Scanning"} · ${status.worker.scan_progress.discovered.toLocaleString()} discovered`
+        : paused ? "Processing is paused" : "Worker is ready";
+  const workerHealthDetail = statusStale
+    ? "Live status unavailable — reconnecting"
+    : activeJobCount > 1
+      ? `${activeJobCount} documents are being analyzed in parallel${paused ? "; pausing afterward" : ""}`
+      : activeJobs[0]
+        ? `Document #${activeJobs[0].document_id} is ${titleCase(activeJobs[0].state)}${paused ? "; pausing afterward" : ""}`
+        : status.worker.scan_progress
+          ? `${titleCase(status.worker.scan_progress.trigger)} scan: ${status.worker.scan_progress.discovered.toLocaleString()} discovered, ${status.worker.scan_progress.queued.toLocaleString()} queued${paused ? "; pausing afterward" : ""}`
+          : paused
+            ? "Paused — queued documents are preserved"
+            : status.worker.next_scan_at ? `Next scan ${formatRelativeTime(status.worker.next_scan_at)}` : "Ready for a manual scan";
 
   return (
     <div className="page">
@@ -55,9 +75,10 @@ export function OverviewPage() {
       )}
 
       <WorkerLiveStatus worker={status.worker} lastSuccessAt={statusLastSuccessAt} pollError={statusPollError} />
+      {activeJobCount > 1 && <ActiveDocuments jobs={activeJobs} paused={paused} />}
 
       <div className="metric-grid">
-        <MetricCard label="Active queue" value={queueTotal.toLocaleString()} meta={status.worker.active_job ? `${paused ? "Finishing" : "Working on"} document #${status.worker.active_job.document_id}` : status.worker.scan_progress ? `${paused ? "Finishing scan" : "Scanning"} · ${status.worker.scan_progress.discovered.toLocaleString()} discovered` : paused ? "Processing is paused" : "Worker is ready"} mark="Q" tone="accent" />
+        <MetricCard label="Active queue" value={queueTotal.toLocaleString()} meta={activeQueueDetail} mark="Q" tone="accent" />
         <MetricCard label="Awaiting review" value={(status.queue.awaiting_review ?? 0).toLocaleString()} meta={status.queue.awaiting_review ? "Your decision needed" : "All caught up"} mark="R" tone="gold" link="/review" />
         <MetricCard label="Tokens this month" value={stats.loading ? undefined : stats.error ? "—" : formatTokens(stats.data?.totals.total_tokens ?? 0)} meta={stats.data ? `${stats.data.totals.requests.toLocaleString()} AI requests` : "Usage unavailable"} mark="T" tone="violet" />
         <MetricCard label="Completed" value={(status.queue.completed ?? 0).toLocaleString()} meta="In recorded history" mark="✓" tone="green" />
@@ -79,7 +100,7 @@ export function OverviewPage() {
             <div className="health-list">
               <HealthRow label="Paperless-ngx" detail={status.paperless.message ?? settings.paperless.base_url} state={status.paperless.state} />
               <HealthRow label={activeProvider?.name ?? "AI provider"} detail={activeProvider?.model || status.provider.message || "Not configured"} state={status.provider.state} />
-              <HealthRow label="Processing worker" detail={statusStale ? "Live status unavailable — reconnecting" : status.worker.active_job ? `Document #${status.worker.active_job.document_id} is ${titleCase(status.worker.active_job.state)}${paused ? "; pausing afterward" : ""}` : status.worker.scan_progress ? `${titleCase(status.worker.scan_progress.trigger)} scan: ${status.worker.scan_progress.discovered.toLocaleString()} discovered, ${status.worker.scan_progress.queued.toLocaleString()} queued${paused ? "; pausing afterward" : ""}` : paused ? "Paused — queued documents are preserved" : status.worker.next_scan_at ? `Next scan ${formatRelativeTime(status.worker.next_scan_at)}` : "Ready for a manual scan"} state={statusStale ? "disconnected" : status.worker.state === "running" || status.worker.state === "scanning" ? "connected" : paused ? "degraded" : "disconnected"} />
+              <HealthRow label="Processing worker" detail={workerHealthDetail} state={statusStale ? "disconnected" : status.worker.state === "running" || status.worker.state === "scanning" ? "connected" : paused ? "degraded" : "disconnected"} />
             </div>
           </Card>
           <Card>
@@ -95,6 +116,28 @@ export function OverviewPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+function ActiveDocuments({ jobs, paused }: { jobs: ActiveJob[]; paused: boolean }) {
+  return (
+    <section className="active-documents" aria-label="Active AI analyses">
+      <div className="active-documents__heading">
+        <div><span className="eyebrow">In progress</span><strong>{paused ? "Finishing active requests" : "Parallel document analysis"}</strong></div>
+        <Badge tone={paused ? "warning" : "accent"}>{jobs.length} active</Badge>
+      </div>
+      <div className="active-documents__list">
+        {jobs.map((job) => (
+          <div className="active-documents__item" key={job.id}>
+            <span aria-hidden="true">{job.document_title?.slice(0, 1).toUpperCase() || "D"}</span>
+            <div>
+              <strong>{job.document_title || `Document #${job.document_id}`}</strong>
+              <small>Document #{job.document_id} · {titleCase(job.state)} · updated {formatRelativeTime(job.updated_at)}</small>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

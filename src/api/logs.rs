@@ -20,6 +20,7 @@ pub(super) struct DiagnosticLogsResponse {
 struct DiagnosticWorkerSnapshot {
     state: &'static str,
     active: bool,
+    active_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     scan_discovered: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,6 +48,11 @@ pub(super) async fn tail(
         .scan_progress
         .as_ref()
         .map(|progress| progress.queued);
+    let active_count = if runtime.active_job_ids.is_empty() {
+        usize::from(runtime.active_job_id.is_some())
+    } else {
+        runtime.active_job_ids.len()
+    };
     let worker = DiagnosticWorkerSnapshot {
         state: match runtime.state.as_str() {
             "running" => "running",
@@ -56,7 +62,8 @@ pub(super) async fn tail(
             "error" => "error",
             _ => "unknown",
         },
-        active: runtime.active_job_id.is_some(),
+        active: active_count > 0,
+        active_count,
         scan_discovered,
         scan_queued,
         last_scan_at: runtime.last_scan_at,

@@ -153,14 +153,19 @@ jobs:
           import pathlib, tomllib
           print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])
           ')"
+          binary="target/${{ matrix.target }}/release/paperless-llm"
           bundle="target/${{ matrix.target }}/release/PaperlessLLM.app"
+          codesign --force --sign - "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
           packaging/macos/create-app-bundle.sh \
-            --binary "target/${{ matrix.target }}/release/paperless-llm" \
+            --binary "$binary" \
             --version "$version" \
             --build-version "$GITHUB_RUN_NUMBER" \
             --output "$bundle"
           plutil -lint "$bundle/Contents/Info.plist"
           test "$(plutil -extract CFBundleExecutable raw "$bundle/Contents/Info.plist")" = "paperless-llm"
+          codesign --verify --strict --verbose=2 "$bundle/Contents/MacOS/paperless-llm"
+          codesign --verify --deep --strict --verbose=2 "$bundle"
           "$bundle/Contents/MacOS/paperless-llm" --help >/dev/null
 
       - name: Smoke test CLI and health endpoint

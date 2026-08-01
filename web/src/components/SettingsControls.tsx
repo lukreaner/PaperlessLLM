@@ -9,6 +9,68 @@ export const functionDescriptions: Array<{ key: keyof FunctionSettings; label: s
   { key: "custom_fields", label: "Custom Fields", description: "Extract values for selected Paperless custom fields." },
 ];
 
+export function WorkflowModeControl({ reviewMode, savedReviewMode, activationContext = "settings", onChange }: {
+  reviewMode: boolean;
+  savedReviewMode?: boolean;
+  activationContext?: "settings" | "setup";
+  onChange: (reviewMode: boolean) => void;
+}) {
+  const selectedLabel = reviewMode ? "Review mode" : "Automatic mode";
+  const savedLabel = savedReviewMode ? "Review mode" : "Automatic mode";
+  const hasUnsavedModeChange = savedReviewMode !== undefined && savedReviewMode !== reviewMode;
+  const status = activationContext === "setup"
+    ? {
+        title: `${selectedLabel} selected.`,
+        detail: `It will become active when you finish setup.`,
+      }
+    : hasUnsavedModeChange
+      ? {
+          title: `${selectedLabel} selected — save changes to activate it.`,
+          detail: `${savedLabel} remains active until you save.`,
+        }
+      : {
+          title: `${selectedLabel} is active.`,
+          detail: reviewMode
+            ? "Every successful suggestion will wait for your approval."
+            : "Successful suggestions will be applied without approval.",
+        };
+
+  return (
+    <div className="workflow-mode-control">
+      <div className="workflow-mode-options" role="radiogroup" aria-label="Apply behavior">
+        <button type="button" role="radio" aria-checked={!reviewMode} className={!reviewMode ? "is-selected" : ""} onClick={() => onChange(false)}>
+          <span className="workflow-mode-option__mark" aria-hidden="true">A</span>
+          <span><strong>Automatic</strong><small>Apply every successful AI result to Paperless immediately.</small></span>
+        </button>
+        <button type="button" role="radio" aria-checked={reviewMode} className={reviewMode ? "is-selected" : ""} onClick={() => onChange(true)}>
+          <span className="workflow-mode-option__mark" aria-hidden="true">R</span>
+          <span><strong>Review before applying</strong><small>Hold suggestions in Review; Paperless stays unchanged until you approve.</small></span>
+        </button>
+      </div>
+      <p className={`workflow-mode-status ${reviewMode ? "is-review" : "is-automatic"}`} role="status">
+        <strong>{status.title}</strong>{" "}{status.detail}
+      </p>
+    </div>
+  );
+}
+
+export function clampInferenceConcurrency(raw: string | number): number {
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.min(8, Math.max(1, Math.trunc(parsed)));
+}
+
+export function InferenceConcurrencyControl({ value, onChange }: {
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <Field label="Parallel AI analyses" hint="1 is safest for provider rate limits. Higher values process documents faster but consume quota in parallel.">
+      <Input type="number" min="1" max="8" step="1" value={clampInferenceConcurrency(value)} onChange={(event) => onChange(clampInferenceConcurrency(event.target.value))} />
+    </Field>
+  );
+}
+
 export function ProcessingControls({ value, tags, customFields, onChange, compact = false }: {
   value: ProcessingSettings;
   tags: CatalogItem[];

@@ -56,7 +56,12 @@ async fn diagnostic_log_api_returns_only_structured_safe_context() {
             "ocr_text=private document body\n",
             "2026-08-01T10:00:01Z WARN provider request failed status=failed ",
             "error=provider analysis failed with HTTP 400: ",
-            "PROMPT_PRIVATE_DIAGNOSTIC_ECHO sk-hostile-diagnostic-token\n"
+            "PROMPT_PRIVATE_DIAGNOSTIC_ECHO sk-hostile-diagnostic-token\n",
+            "2026-08-01T10:00:02Z WARN provider request failed ",
+            "event=provider.request_failed provider=openai api_family=responses ",
+            "operation=analysis attempt=1 status=failed latency_ms=321 ",
+            "error_code=provider_remote upstream_status=429 timed_out=false ",
+            "response_body=PRIVATE_UPSTREAM_BODY\n"
         ),
     )
     .expect("diagnostic log");
@@ -90,6 +95,20 @@ async fn diagnostic_log_api_returns_only_structured_safe_context() {
     );
     assert_eq!(json["worker"]["state"], "running");
     assert_eq!(json["worker"]["active"], false);
+    assert_eq!(json["worker"]["active_count"], 0);
+    assert_eq!(json["entries"][2]["event"], "provider.request_failed");
+    assert_eq!(json["entries"][2]["fields"]["provider"], "openai");
+    assert_eq!(json["entries"][2]["fields"]["api_family"], "responses");
+    assert_eq!(json["entries"][2]["fields"]["operation"], "analysis");
+    assert_eq!(json["entries"][2]["fields"]["attempt"], "1");
+    assert_eq!(json["entries"][2]["fields"]["status"], "failed");
+    assert_eq!(json["entries"][2]["fields"]["latency_ms"], "321");
+    assert_eq!(
+        json["entries"][2]["fields"]["error_code"],
+        "provider_remote"
+    );
+    assert_eq!(json["entries"][2]["fields"]["upstream_status"], "429");
+    assert_eq!(json["entries"][2]["fields"]["timed_out"], "false");
     let serialized = String::from_utf8(body.to_vec()).expect("UTF-8 JSON");
     assert!(!serialized.contains("private-token"));
     assert!(!serialized.contains("private document body"));
@@ -97,6 +116,8 @@ async fn diagnostic_log_api_returns_only_structured_safe_context() {
     assert!(!serialized.contains("ocr_text"));
     assert!(!serialized.contains("PROMPT_PRIVATE_DIAGNOSTIC_ECHO"));
     assert!(!serialized.contains("sk-hostile-diagnostic-token"));
+    assert!(!serialized.contains("PRIVATE_UPSTREAM_BODY"));
+    assert!(!serialized.contains("response_body"));
 }
 
 #[tokio::test]
@@ -124,4 +145,5 @@ async fn diagnostic_log_worker_snapshot_distinguishes_paused_state() {
     let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
     assert_eq!(json["worker"]["state"], "paused");
     assert_eq!(json["worker"]["active"], false);
+    assert_eq!(json["worker"]["active_count"], 0);
 }

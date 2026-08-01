@@ -17,3 +17,8 @@ pub mod worker;
 
 pub use app::{AppState, RuntimeOptions, build_router, run};
 pub use error::{AppError, AppResult};
+
+/// Opaque fingerprint of the executable inputs, target, profile, features,
+/// and Rust toolchain. It is intentionally independent of packaging and code
+/// signatures so the CLI and desktop launcher from one build can interoperate.
+pub const BUILD_ID: &str = env!("PAPERLESS_LLM_BUILD_ID");

@@ -96,6 +96,7 @@ async fn private_api_response(request: Request, next: Next) -> Response {
 
 async fn healthz(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
+        "build_id": crate::BUILD_ID,
         "instance_id": state.instance_id.as_ref(),
         "service": "paperless-llm",
         "status": "ok",
@@ -455,7 +456,14 @@ async fn status_configuration(state: &AppState) -> AppResult<StatusConfiguration
 
 async fn build_worker_status(state: &AppState) -> AppResult<WorkerStatusDto> {
     let runtime = state.worker.runtime_state().await;
-    let active_job = if let Some(job_id) = runtime.active_job_id.as_deref() {
+    let mut active_job_ids = runtime.active_job_ids.clone();
+    if active_job_ids.is_empty()
+        && let Some(job_id) = runtime.active_job_id.as_ref()
+    {
+        active_job_ids.push(job_id.clone());
+    }
+    let mut active_jobs = Vec::with_capacity(active_job_ids.len());
+    for job_id in &active_job_ids {
         let row: Option<(String, i64, String, String, String)> = sqlx::query_as(
             "SELECT id, paperless_document_id, COALESCE(document_title,''), status, updated_at \
              FROM jobs WHERE id=?",
@@ -463,26 +471,28 @@ async fn build_worker_status(state: &AppState) -> AppResult<WorkerStatusDto> {
         .bind(job_id)
         .fetch_optional(state.database.pool())
         .await?;
-        row.map(
-            |(id, document_id, document_title, job_state, updated_at)| ActiveJobDto {
+        if let Some((id, document_id, document_title, job_state, updated_at)) = row {
+            active_jobs.push(ActiveJobDto {
                 id,
                 document_id,
                 document_title,
                 state: job_state,
                 updated_at,
-            },
-        )
-    } else {
-        None
-    };
+            });
+        }
+    }
+    let active_job = active_jobs.first().cloned();
+    let active_job_id = active_job.as_ref().map(|job| job.id.clone());
 
     Ok(WorkerStatusDto {
         state: runtime.state,
         paused: runtime.paused,
         last_scan_at: runtime.last_scan_at,
         next_scan_at: runtime.next_scan_at,
-        active_job_id: runtime.active_job_id,
+        active_job_id,
         active_job,
+        active_job_ids,
+        active_jobs,
         scan_progress: runtime.scan_progress.map(|progress| ScanProgressDto {
             trigger: progress.trigger,
             discovered: progress.discovered,
@@ -823,11 +833,18 @@ struct JobDto {
     state: String,
     attempt: i64,
     provider_name: Option<String>,
+    provider_kind: String,
+    api_family: String,
     model: Option<String>,
     functions_json: String,
     created_at: String,
     updated_at: String,
-    error: Option<String>,
+    job_error_code: Option<String>,
+    stored_error: Option<String>,
+    provider_operation: Option<String>,
+    provider_status: Option<String>,
+    provider_latency_ms: Option<i64>,
+    provider_error_code: Option<String>,
     truncated: bool,
     token_total: i64,
 }
@@ -841,11 +858,20 @@ struct JobResponseItem {
     state: String,
     attempt: i64,
     provider_name: Option<String>,
+    provider_kind: Option<String>,
+    api_family: Option<String>,
     model: Option<String>,
     functions: Vec<String>,
     created_at: String,
     updated_at: String,
     error: Option<String>,
+    error_code: Option<String>,
+    failure_phase: Option<&'static str>,
+    upstream_status: Option<u16>,
+    provider_operation: Option<String>,
+    provider_attempt: Option<u8>,
+    provider_status: Option<String>,
+    provider_latency_ms: Option<i64>,
     truncated: bool,
     token_total: i64,
 }
@@ -884,10 +910,13 @@ async fn list_jobs(
     .fetch_one(state.database.pool()).await?;
     let rows: Vec<JobDto> = sqlx::query_as(
         "SELECT j.id,j.paperless_document_id AS document_id,COALESCE(j.document_title,'') AS document_title,NULL AS document_url,j.status AS state,j.attempt_count AS attempt,\
-         pp.name AS provider_name,pp.model,\
+         pp.name AS provider_name,CASE WHEN pp.provider_preset='custom' AND pp.provider_kind<>'custom' THEN pp.provider_kind ELSE pp.provider_preset END AS provider_kind,pp.api_family,pp.model,\
          json_array(CASE WHEN pr.tags_enabled THEN 'tags' END,CASE WHEN pr.correspondent_enabled THEN 'correspondent' END,CASE WHEN pr.document_type_enabled THEN 'document_type' END,CASE WHEN pr.title_enabled THEN 'title' END,CASE WHEN pr.custom_fields_enabled THEN 'custom_fields' END) AS functions_json,\
-         j.queued_at AS created_at,j.updated_at,j.error_message AS error,j.truncated,COALESCE((SELECT SUM(u.total_tokens) FROM usage_events u WHERE u.job_id=j.id),0) AS token_total \
+         j.queued_at AS created_at,j.updated_at,j.error_code AS job_error_code,j.error_message AS stored_error,\
+         latest.operation AS provider_operation,latest.status AS provider_status,latest.latency_ms AS provider_latency_ms,latest.error_code AS provider_error_code,\
+         j.truncated,COALESCE((SELECT SUM(u.total_tokens) FROM usage_events u WHERE u.job_id=j.id),0) AS token_total \
          FROM jobs j JOIN processing_profiles pr ON pr.id=j.processing_profile_id JOIN provider_profiles pp ON pp.id=pr.provider_profile_id \
+         LEFT JOIN usage_events latest ON latest.id=(SELECT u.id FROM usage_events u WHERE u.job_id=j.id ORDER BY u.created_at DESC,u.id DESC LIMIT 1) \
          WHERE (? IS NULL OR j.status=?) AND (? IS NULL OR j.document_title LIKE ? OR CAST(j.paperless_document_id AS TEXT) LIKE ?) \
          ORDER BY j.updated_at DESC LIMIT ? OFFSET ?",
     )
@@ -906,6 +935,31 @@ async fn list_jobs(
                 .into_iter()
                 .flatten()
                 .collect();
+            let provider_operation =
+                safe_activity_operation(row.provider_operation.as_deref()).map(str::to_owned);
+            let provider_attempt = match provider_operation.as_deref() {
+                Some("analysis") => Some(1),
+                Some("repair") => Some(2),
+                _ => None,
+            };
+            let provider_status =
+                safe_activity_provider_status(row.provider_status.as_deref()).map(str::to_owned);
+            let provider_error_code = (row.state == "failed"
+                && provider_status.as_deref() == Some("failed"))
+            .then_some(row.provider_error_code.as_deref())
+            .flatten();
+            let failure = matches!(row.state.as_str(), "failed" | "budget_blocked")
+                .then(|| {
+                    crate::diagnostics::safe_job_failure_context(
+                        row.job_error_code.as_deref(),
+                        provider_error_code,
+                        row.stored_error.as_deref(),
+                    )
+                })
+                .flatten();
+            let failure_phase = failure
+                .as_ref()
+                .map(|failure| activity_failure_phase(&failure.code));
             JobResponseItem {
                 id: row.id,
                 document_id: row.document_id,
@@ -916,11 +970,20 @@ async fn list_jobs(
                 state: row.state,
                 attempt: row.attempt,
                 provider_name: row.provider_name,
+                provider_kind: safe_activity_provider(&row.provider_kind).map(str::to_owned),
+                api_family: safe_activity_api_family(&row.api_family).map(str::to_owned),
                 model: row.model,
                 functions,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
-                error: row.error,
+                error: failure.as_ref().map(|failure| failure.message.clone()),
+                error_code: failure.as_ref().map(|failure| failure.code.clone()),
+                failure_phase,
+                upstream_status: failure.and_then(|failure| failure.upstream_status),
+                provider_operation,
+                provider_attempt,
+                provider_status,
+                provider_latency_ms: row.provider_latency_ms.filter(|latency| *latency >= 0),
                 truncated: row.truncated,
                 token_total: row.token_total,
             }
@@ -932,6 +995,59 @@ async fn list_jobs(
         limit,
         offset,
     }))
+}
+
+fn safe_activity_provider(value: &str) -> Option<&str> {
+    match value {
+        "openai" | "claude" | "lmstudio" | "custom" | "mistral" | "kimi" | "moonshot"
+        | "google" => Some(value),
+        _ => None,
+    }
+}
+
+fn safe_activity_api_family(value: &str) -> Option<&str> {
+    match value {
+        "responses" | "chat_completions" | "messages" => Some(value),
+        _ => None,
+    }
+}
+
+fn safe_activity_operation(value: Option<&str>) -> Option<&str> {
+    match value? {
+        "analysis" | "repair" | "probe" | "token_count" => value,
+        _ => None,
+    }
+}
+
+fn safe_activity_provider_status(value: Option<&str>) -> Option<&str> {
+    match value? {
+        "succeeded" | "failed" => value,
+        _ => None,
+    }
+}
+
+fn activity_failure_phase(code: &str) -> &'static str {
+    match code {
+        "apply_failed" => "paperless_apply",
+        "budget_exhausted" => "budget",
+        "paperless_authentication"
+        | "paperless_configuration"
+        | "paperless_error"
+        | "paperless_forbidden"
+        | "paperless_http_error"
+        | "paperless_not_found"
+        | "paperless_pagination_origin"
+        | "paperless_transport" => "paperless",
+        "provider_configuration"
+        | "provider_error"
+        | "provider_http_error"
+        | "provider_remote"
+        | "provider_transport"
+        | "invalid_structured_output"
+        | "upstream_error" => "provider",
+        "validation_failed" => "preflight",
+        _ => "processing",
+    }
 }
 
 async fn retry_job(

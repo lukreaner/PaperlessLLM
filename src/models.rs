@@ -213,6 +213,7 @@ pub struct UsageRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
+    pub build_id: &'static str,
     pub instance_id: String,
     pub service: &'static str,
     pub status: &'static str,

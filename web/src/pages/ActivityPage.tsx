@@ -15,6 +15,44 @@ const states: Array<{ value: "" | JobState; label: string }> = [
 
 const tone: Record<JobState, "neutral" | "success" | "warning" | "danger" | "info" | "accent"> = { queued: "neutral", analyzing: "accent", awaiting_review: "warning", applying: "info", completed: "success", budget_blocked: "warning", failed: "danger", rejected: "neutral" };
 
+function providerKindLabel(kind?: Job["provider_kind"]) {
+  if (!kind) return "—";
+  if (kind === "openai") return "OpenAI";
+  if (kind === "lmstudio") return "LM Studio";
+  return titleCase(kind);
+}
+
+function apiFamilyLabel(family?: Job["api_family"]) {
+  if (family === "responses") return "Responses API";
+  if (family === "chat_completions") return "Chat Completions";
+  if (family === "messages") return "Anthropic Messages";
+  return "—";
+}
+
+function failurePhaseLabel(phase?: Job["failure_phase"]) {
+  if (phase === "preflight") return "AI request preflight";
+  if (phase === "provider") return "AI provider";
+  if (phase === "paperless") return "Paperless API";
+  if (phase === "paperless_apply") return "Paperless update";
+  if (phase === "budget") return "Token budget";
+  return phase === "processing" ? "Document processing" : "—";
+}
+
+function latestProviderAttempt(job: Job) {
+  if (!job.provider_operation || !job.provider_status) {
+    return job.failure_phase === "preflight"
+      ? "No AI inference recorded · 0 inference attempts"
+      : "No recorded AI request";
+  }
+  const latency = job.provider_latency_ms === undefined
+    ? ""
+    : job.provider_latency_ms < 1_000
+      ? ` · ${job.provider_latency_ms} ms`
+      : ` · ${(job.provider_latency_ms / 1_000).toFixed(1)} s`;
+  const attempt = job.provider_attempt === undefined ? "" : `Attempt ${job.provider_attempt} · `;
+  return `${attempt}${titleCase(job.provider_operation)} · ${titleCase(job.provider_status)}${latency}`;
+}
+
 export function ActivityPage() {
   const [state, setState] = useState("");
   const [query, setQuery] = useState("");
@@ -113,7 +151,7 @@ export function ActivityPage() {
   );
 }
 
-function ActivityTableRow({ job, expanded, retrying, onExpand, onRetry, onRemove }: { job: Job; expanded: boolean; retrying: boolean; onExpand: () => void; onRetry: () => void; onRemove: () => void }) {
+export function ActivityTableRow({ job, expanded, retrying, onExpand, onRetry, onRemove }: { job: Job; expanded: boolean; retrying: boolean; onExpand: () => void; onRetry: () => void; onRemove: () => void }) {
   const retryable = job.state === "failed" || job.state === "rejected" || job.state === "completed";
   const removable = job.state === "queued" || job.state === "budget_blocked";
   return <>
@@ -125,6 +163,30 @@ function ActivityTableRow({ job, expanded, retrying, onExpand, onRetry, onRemove
       <td><time dateTime={job.updated_at}>{formatDateTime(job.updated_at)}</time></td>
       <td><button className="row-menu" aria-label={expanded ? "Hide job details" : "Show job details"} onClick={onExpand}>{expanded ? "−" : "•••"}</button></td>
     </tr>
-    {expanded && <tr className="expanded-row"><td colSpan={6}><div className="job-detail"><div><span>Enabled functions</span><strong>{job.functions.length ? job.functions.map(titleCase).join(", ") : "None recorded"}</strong></div><div><span>Created</span><strong>{formatDateTime(job.created_at)}</strong></div>{job.error && <div className="job-error"><span>Detail</span><code>{job.error}</code></div>}<div className="job-detail__actions">{job.document_url && <a href={job.document_url} target="_blank" rel="noreferrer" className="button button--ghost button--sm">Open in Paperless ↗</a>}{removable && <Button size="sm" variant="danger" onClick={onRemove}>Remove from queue</Button>}{retryable && <Button size="sm" variant="secondary" loading={retrying} onClick={onRetry}>Reprocess</Button>}</div></div></td></tr>}
+    {expanded && <tr className="expanded-row"><td colSpan={6}>
+      <div className="job-detail">
+        <div><span>Enabled functions</span><strong>{job.functions.length ? job.functions.map(titleCase).join(", ") : "None recorded"}</strong></div>
+        <div><span>Created</span><strong>{formatDateTime(job.created_at)}</strong></div>
+        <div><span>Job attempt</span><strong>{job.attempt}</strong></div>
+        <div><span>Provider adapter</span><strong>{providerKindLabel(job.provider_kind)}</strong></div>
+        <div><span>API family</span><strong>{apiFamilyLabel(job.api_family)}</strong></div>
+        <div><span>Latest AI request</span><strong>{latestProviderAttempt(job)}</strong></div>
+        {job.error && <div className="job-error" role="alert">
+          <span>Safe failure detail</span>
+          <strong>{job.error}</strong>
+          <div className="job-error__meta">
+            {job.error_code && <code>{job.error_code}</code>}
+            {job.failure_phase && <small>{failurePhaseLabel(job.failure_phase)}</small>}
+            {job.upstream_status !== undefined && <small>Upstream HTTP {job.upstream_status}</small>}
+          </div>
+        </div>}
+        <div className="job-detail__actions">
+          {job.error && <a href="/logs" className="button button--ghost button--sm">Open safe logs</a>}
+          {job.document_url && <a href={job.document_url} target="_blank" rel="noreferrer" className="button button--ghost button--sm">Open in Paperless ↗</a>}
+          {removable && <Button size="sm" variant="danger" onClick={onRemove}>Remove from queue</Button>}
+          {retryable && <Button size="sm" variant="secondary" loading={retrying} onClick={onRetry}>Reprocess</Button>}
+        </div>
+      </div>
+    </td></tr>}
   </>;
 }

@@ -181,7 +181,8 @@ impl BudgetService {
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await?;
-        let result = reconcile_stale_in_transaction(&mut connection).await;
+        let result =
+            reconcile_reserved_in_transaction(&mut connection, None, "interrupted_unknown").await;
         match result {
             Ok(reconciled) => {
                 sqlx::query("COMMIT").execute(&mut *connection).await?;
@@ -279,14 +280,30 @@ struct StaleReservation {
     model: String,
 }
 
-async fn reconcile_stale_in_transaction(connection: &mut SqliteConnection) -> AppResult<u64> {
+/// Reconcile only reservations owned by one failed worker job. The caller is
+/// responsible for wrapping this and the corresponding job-state update in a
+/// single transaction so a task failure cannot leave either side stranded.
+pub(crate) async fn reconcile_job_reservations_in_transaction(
+    connection: &mut SqliteConnection,
+    job_id: &str,
+) -> AppResult<u64> {
+    reconcile_reserved_in_transaction(connection, Some(job_id), "internal_error").await
+}
+
+async fn reconcile_reserved_in_transaction(
+    connection: &mut SqliteConnection,
+    job_id: Option<&str>,
+    error_code: &str,
+) -> AppResult<u64> {
     let reservations: Vec<StaleReservation> = sqlx::query_as(
         "SELECT r.id,r.job_id,r.provider_profile_id,r.reserved_tokens,r.operation,COALESCE(r.api_family,p.api_family,'unknown') AS api_family,r.functions_json,r.input_tokens, \
                 COALESCE(NULLIF(r.provider_preset,''),CASE WHEN p.provider_preset='custom' AND p.provider_kind<>'custom' THEN p.provider_kind ELSE p.provider_preset END,p.provider_kind,'unknown') AS provider_preset, \
                 COALESCE(NULLIF(r.model,''),NULLIF(p.model,''),'unknown') AS model \
          FROM budget_reservations r LEFT JOIN provider_profiles p ON p.id=r.provider_profile_id \
-         WHERE r.state='reserved' ORDER BY r.created_at,r.id",
+         WHERE r.state='reserved' AND (? IS NULL OR r.job_id=?) ORDER BY r.created_at,r.id",
     )
+    .bind(job_id)
+    .bind(job_id)
     .fetch_all(&mut *connection)
     .await?;
     let mut reconciled = 0_u64;
@@ -306,7 +323,7 @@ async fn reconcile_stale_in_transaction(connection: &mut SqliteConnection) -> Ap
         let output = reservation.reserved_tokens.saturating_sub(input);
         sqlx::query(
             "INSERT INTO usage_events(id,budget_reservation_id,job_id,provider_profile_id,provider_kind,model,api_family,operation,functions_json,status,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens,usage_source,latency_ms,error_code) \
-             VALUES(?,?,?,?,?,?,?,?,?,'failed',?,0,0,?,0,?,'reserved_after_unknown',0,'interrupted_unknown')",
+             VALUES(?,?,?,?,?,?,?,?,?,'failed',?,0,0,?,0,?,'reserved_after_unknown',0,?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&reservation.id)
@@ -320,6 +337,7 @@ async fn reconcile_stale_in_transaction(connection: &mut SqliteConnection) -> Ap
         .bind(input)
         .bind(output)
         .bind(reservation.reserved_tokens)
+        .bind(error_code)
         .execute(&mut *connection)
         .await?;
         reconciled = reconciled.saturating_add(1);

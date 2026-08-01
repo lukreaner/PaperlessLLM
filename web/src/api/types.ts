@@ -8,6 +8,7 @@ export type ProviderKind =
   | "lmstudio"
   | "custom";
 export type ProviderTransport = "responses" | "chat_completions" | "anthropic_messages";
+export type ProviderApiFamily = "responses" | "chat_completions" | "messages";
 export type JobState =
   | "queued"
   | "analyzing"
@@ -53,6 +54,8 @@ export interface WorkerStatus {
   next_scan_at?: string;
   active_job_id?: string;
   active_job?: ActiveJob;
+  active_job_ids?: string[];
+  active_jobs?: ActiveJob[];
   scan_progress?: ScanProgress;
 }
 
@@ -156,6 +159,7 @@ export interface OverwriteSettings {
 export interface ProcessingSettings {
   poll_interval_minutes: number;
   max_documents_per_scan: number | null;
+  inference_concurrency: number;
   review_mode: boolean;
   use_existing_correspondents_and_tags: boolean;
   process_only_tagged: boolean;
@@ -238,6 +242,7 @@ export interface DiagnosticLogEntry {
 export interface DiagnosticWorkerSnapshot {
   state: "running" | "scanning" | "pausing" | "paused" | "error" | "unknown";
   active: boolean;
+  active_count: number;
   scan_discovered?: number;
   scan_queued?: number;
   last_scan_at?: string;
@@ -268,11 +273,20 @@ export interface Job {
   state: JobState;
   attempt: number;
   provider_name?: string;
+  provider_kind?: ProviderKind;
+  api_family?: ProviderApiFamily;
   model?: string;
   functions: string[];
   created_at: string;
   updated_at: string;
   error?: string;
+  error_code?: string;
+  failure_phase?: "preflight" | "provider" | "paperless" | "paperless_apply" | "budget" | "processing";
+  upstream_status?: number;
+  provider_operation?: "analysis" | "repair" | "probe" | "token_count";
+  provider_attempt?: number;
+  provider_status?: "succeeded" | "failed";
+  provider_latency_ms?: number;
   truncated?: boolean;
   token_total?: number;
 }

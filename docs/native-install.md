@@ -59,11 +59,11 @@ To upgrade, first use **Quit PaperlessLLM** in the dashboard, extract the newer 
 
 ### Double-click installation
 
-Extract the archive and double-click `PaperlessLLM.app`. You may first drag it to `/Applications` or `~/Applications` so it remains available after deleting the extracted archive. Each activation invokes `paperless-llm launch`: it starts the background service when needed, reuses an existing instance, and opens the dashboard in the default browser.
+Extract the archive and double-click `PaperlessLLM.app`. You may first drag it to `/Applications` or `~/Applications` so it remains available after deleting the extracted archive. Each activation invokes `paperless-llm launch`: it starts the background service when needed, reuses an existing instance only when its data-directory and build fingerprints both match, and opens the dashboard in the default browser. If an older or different build still owns the data directory, PaperlessLLM asks you to quit that instance and open the new app again instead of silently serving its stale dashboard.
 
 If the browser does not open, visit `http://127.0.0.1:8765`. The first launch opens the setup wizard.
 
-Release automation signs the standalone CLI and app, submits both for notarization, and staples the app only when the project maintainers configure Apple credentials. For an unsigned build, verify the checksum and release source first. You may then right-click the app and choose **Open** to use macOS's confirmation flow. Removing quarantine is a separate, advanced option:
+Release automation always gives the standalone CLI and completed app bundle structurally valid ad-hoc signatures. It replaces those signatures with Developer ID signing, submits the deliverables for notarization, and staples the app only when the project maintainers configure Apple credentials. An ad-hoc signature does not establish publisher trust, so verify the checksum and release source first. You may then right-click the app and choose **Open** to use macOS's confirmation flow. Removing quarantine is a separate, advanced option:
 
 ```sh
 xattr -dr com.apple.quarantine PaperlessLLM.app

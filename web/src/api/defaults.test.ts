@@ -56,5 +56,6 @@ describe("safe defaults", () => {
     expect(defaultSettings.limits.global_budget).toEqual({ daily: null, monthly: null });
     expect(defaultSettings.limits.max_input_tokens).toBe(32_000);
     expect(defaultSettings.limits.max_output_tokens).toBe(8_000);
+    expect(defaultSettings.processing.inference_concurrency).toBe(1);
   });
 });

@@ -4,7 +4,7 @@ import { providerPresetOptions } from "../api/defaults";
 import type { AppSettings, BudgetValue, CatalogItem, Catalogs, CustomFieldType, PaperlessTestResult, ProviderKind, ProviderProfile } from "../api/types";
 import { useApp } from "../App";
 import { newProvider, ProviderEditor } from "../components/ProviderEditor";
-import { ProcessingControls } from "../components/SettingsControls";
+import { InferenceConcurrencyControl, ProcessingControls, WorkflowModeControl } from "../components/SettingsControls";
 import { useToast } from "../components/Toast";
 import { Alert, Badge, Button, Card, ConfirmDialog, Field, Input, PageHeader, Select, Textarea, Toggle } from "../components/UI";
 import { formatDateTime, initials, validationMessage } from "../lib/format";
@@ -57,7 +57,7 @@ export function SettingsPage() {
         <div className="settings-content">
           {section === "paperless" && <PaperlessSection settings={draft} catalogs={catalogs} onChange={update} onCatalogs={catalogsChanged} />}
           {section === "providers" && <ProvidersSection activeId={draft.active_provider_id} onActive={(active_provider_id) => update({ ...draft, active_provider_id })} />}
-          {section === "processing" && <ProcessingSection settings={draft} catalogs={catalogs} onChange={update} />}
+          {section === "processing" && <ProcessingSection settings={draft} savedReviewMode={app.settings.processing.review_mode} catalogs={catalogs} onChange={update} />}
           {section === "limits" && <LimitsSection settings={draft} providers={app.providers} onChange={update} />}
           {section === "security" && <SecuritySection settings={draft} onChange={update} />}
         </div>
@@ -103,8 +103,22 @@ function ProvidersSection({ activeId, onActive }: { activeId?: string; onActive:
 
 function ProviderAddMenu({ onAdd }: { onAdd: (kind: ProviderKind) => void }) { const [open, setOpen] = useState(false); return <div className="add-menu"><Button onClick={() => setOpen(!open)}>+ Add provider</Button>{open && <div className="add-menu__popover">{providerPresetOptions.map((preset) => <button key={preset.kind} onClick={() => { onAdd(preset.kind); setOpen(false); }}><strong>{preset.label}</strong><span>{preset.description}</span></button>)}</div>}</div>; }
 
-function ProcessingSection({ settings, catalogs, onChange }: { settings: AppSettings; catalogs: Catalogs; onChange: (settings: AppSettings) => void }) {
-  return <div className="settings-section"><SettingsTitle title="Processing" description="Control discovery, review, AI functions, and exactly how metadata is applied." /><Card><div className="settings-subheading"><h3>Workflow</h3><p>Automatic mode applies successful results immediately. Review mode pauses before every Paperless update.</p></div><div className="form-grid form-grid--two"><Field label="Poll interval (minutes)"><Input type="number" min="1" max="1440" value={settings.processing.poll_interval_minutes} onChange={(event) => onChange({ ...settings, processing: { ...settings.processing, poll_interval_minutes: Number(event.target.value) } })} /></Field><Field label="Maximum documents per scan" hint="Leave empty to discover every matching document; Paperless requests remain paginated."><Input type="number" min="1" max="1000000" placeholder="All matching documents" value={settings.processing.max_documents_per_scan ?? ""} onChange={(event) => onChange({ ...settings, processing: { ...settings.processing, max_documents_per_scan: event.target.value === "" ? null : Number(event.target.value) } })} /></Field><Field label="Apply behavior"><Select value={settings.processing.review_mode ? "review" : "automatic"} onChange={(event) => onChange({ ...settings, processing: { ...settings.processing, review_mode: event.target.value === "review" } })}><option value="automatic">Apply automatically</option><option value="review">Review every suggestion</option></Select></Field></div></Card><Card><ProcessingControls value={settings.processing} tags={catalogs.tags} customFields={catalogs.custom_fields} onChange={(processing) => onChange({ ...settings, processing })} /></Card></div>;
+function ProcessingSection({ settings, savedReviewMode, catalogs, onChange }: { settings: AppSettings; savedReviewMode: boolean; catalogs: Catalogs; onChange: (settings: AppSettings) => void }) {
+  const processing = settings.processing;
+  const updateProcessing = (next: AppSettings["processing"]) => onChange({ ...settings, processing: next });
+  return <div className="settings-section">
+    <SettingsTitle title="Processing" description="Control discovery, review, AI functions, and exactly how metadata is applied." />
+    <Card>
+      <div className="settings-subheading"><h3>Workflow</h3><p>Choose whether AI suggestions are applied immediately or held for your approval.</p></div>
+      <WorkflowModeControl reviewMode={processing.review_mode} savedReviewMode={savedReviewMode} onChange={(review_mode) => updateProcessing({ ...processing, review_mode })} />
+      <div className="form-grid form-grid--three workflow-scheduling-grid">
+        <Field label="Poll interval (minutes)"><Input type="number" min="1" max="1440" value={processing.poll_interval_minutes} onChange={(event) => updateProcessing({ ...processing, poll_interval_minutes: Number(event.target.value) })} /></Field>
+        <Field label="Maximum documents per scan" hint="Leave empty to discover every matching document; Paperless requests remain paginated."><Input type="number" min="1" max="1000000" placeholder="All matching documents" value={processing.max_documents_per_scan ?? ""} onChange={(event) => updateProcessing({ ...processing, max_documents_per_scan: event.target.value === "" ? null : Number(event.target.value) })} /></Field>
+        <InferenceConcurrencyControl value={processing.inference_concurrency ?? 1} onChange={(inference_concurrency) => updateProcessing({ ...processing, inference_concurrency })} />
+      </div>
+    </Card>
+    <Card><ProcessingControls value={processing} tags={catalogs.tags} customFields={catalogs.custom_fields} onChange={updateProcessing} /></Card>
+  </div>;
 }
 
 function LimitsSection({ settings, providers, onChange }: { settings: AppSettings; providers: ProviderProfile[]; onChange: (settings: AppSettings) => void }) {

@@ -6,6 +6,8 @@ usage() {
 Usage: create-app-bundle.sh --binary PATH --version SEMVER --output PATH.app [--build-version NUMBER]
 
 Creates a macOS PaperlessLLM.app bundle without modifying the source binary.
+On macOS, the completed bundle receives a valid ad-hoc signature. Release
+automation may replace it with a Developer ID signature afterward.
 The output path must not already exist.
 EOF
 }
@@ -95,6 +97,15 @@ sed \
 
 if command -v plutil >/dev/null 2>&1; then
   plutil -lint "$bundle/Contents/Info.plist" >/dev/null
+fi
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  command -v codesign >/dev/null 2>&1 || fail "codesign is required on macOS"
+  bundle_binary="$bundle/Contents/MacOS/paperless-llm"
+  codesign --force --sign - "$bundle_binary"
+  codesign --force --sign - "$bundle"
+  codesign --verify --strict --verbose=2 "$bundle_binary"
+  codesign --verify --deep --strict --verbose=2 "$bundle"
 fi
 
 mv "$bundle" "$output"

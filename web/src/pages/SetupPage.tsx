@@ -4,7 +4,7 @@ import { defaultSettings } from "../api/defaults";
 import type { AppSettings, Catalogs, PaperlessTestResult, ProviderKind, ProviderProfile } from "../api/types";
 import { Logo } from "../components/Logo";
 import { newProvider, ProviderEditor } from "../components/ProviderEditor";
-import { ProcessingControls } from "../components/SettingsControls";
+import { InferenceConcurrencyControl, ProcessingControls, WorkflowModeControl } from "../components/SettingsControls";
 import { useToast } from "../components/Toast";
 import { Alert, Button, Card, Field, Input, ProgressBar, Select, Toggle } from "../components/UI";
 import { validationMessage } from "../lib/format";
@@ -122,7 +122,7 @@ export function SetupPage({ onComplete }: { onComplete: () => void }) {
             <div className="setup-panel setup-panel--wide">
               <div className="setup-heading"><span className="eyebrow">Step 4 of 5</span><h2>Decide what AI can change</h2><p>The defaults add metadata conservatively and apply automatically. Turn on review mode to approve each document first.</p></div>
               <Card>
-                <div className="setting-list setup-mode-choice"><Toggle checked={settings.processing.review_mode} onChange={(review_mode) => setSettings({ ...settings, processing: { ...settings.processing, review_mode } })} label="Review suggestions before applying" description="Paperless is not changed until you approve a suggestion." /></div>
+                <div className="setup-mode-choice"><WorkflowModeControl reviewMode={settings.processing.review_mode} activationContext="setup" onChange={(review_mode) => setSettings({ ...settings, processing: { ...settings.processing, review_mode } })} /></div>
                 <ProcessingControls value={settings.processing} tags={catalogs.tags} customFields={catalogs.custom_fields} onChange={(processing) => setSettings({ ...settings, processing })} compact />
               </Card>
             </div>
@@ -138,6 +138,7 @@ export function SetupPage({ onComplete }: { onComplete: () => void }) {
                   <Field label="Monthly token budget" hint="Optional"><Input type="number" min="0" value={settings.limits.global_budget.monthly ?? ""} onChange={(event) => setSettings({ ...settings, limits: { ...settings.limits, global_budget: { ...settings.limits.global_budget, monthly: event.target.value ? Number(event.target.value) : null } } })} placeholder="Unlimited" /></Field>
                   <Field label="Reset timezone"><Input value={settings.limits.reset_timezone} onChange={(event) => setSettings({ ...settings, limits: { ...settings.limits, reset_timezone: event.target.value } })} /></Field>
                   <Field label="Polling interval (minutes)"><Input type="number" min="1" value={settings.processing.poll_interval_minutes} onChange={(event) => setSettings({ ...settings, processing: { ...settings.processing, poll_interval_minutes: Number(event.target.value) } })} /></Field>
+                  <InferenceConcurrencyControl value={settings.processing.inference_concurrency ?? 1} onChange={(inference_concurrency) => setSettings({ ...settings, processing: { ...settings.processing, inference_concurrency } })} />
                 </div>
                 <div className="setting-list setup-security">
                   <Toggle checked={settings.security.lan_enabled} onChange={(lan_enabled) => setSettings({ ...settings, security: { ...settings.security, lan_enabled } })} label="Require authentication for network access" description="Use an HTTPS reverse proxy; the listener address remains controlled by the --bind startup option." />

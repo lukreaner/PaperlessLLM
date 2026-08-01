@@ -6,7 +6,7 @@ test("dashboard quit confirms the action, sends the protected header, and shows 
   const settings = structuredClone(defaultSettings);
   settings.paperless = { base_url: "https://paperless.example", api_token_configured: true };
   const status = {
-    version: "0.1.0",
+    version: "0.1.1",
     setup_required: false,
     worker: { state: "running", last_scan_at: null, next_scan_at: null, active_job_id: null },
     paperless: { state: "connected", message: "Paperless connected" },

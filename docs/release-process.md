@@ -21,7 +21,7 @@ The workflow can also be dispatched manually for an existing tag. Re-running it 
 
 ## Optional Apple signing and notarization
 
-Without signing secrets, the workflow deliberately publishes unsigned macOS deliverables. Configure all signing secrets to enable hardened-runtime signing of the standalone CLI and app bundle:
+Without signing secrets, the workflow publishes the standalone CLI and completed app bundle with valid ad-hoc signatures and verifies them strictly before packaging. This seals the executable plus `Info.plist` and the bundle resources so the deliverables are structurally valid, but it does not establish a trusted developer identity or satisfy notarization. Configure all signing secrets to replace the ad-hoc signatures with hardened-runtime Developer ID signatures on the standalone CLI and app bundle:
 
 | Repository secret | Value |
 | --- | --- |
@@ -60,7 +60,7 @@ Download every asset and run:
 sha256sum --check SHA256SUMS
 ```
 
-For macOS signed builds, inspect the standalone CLI and verify the app after extraction:
+For every macOS build, verify the standalone CLI and the completed app after extraction:
 
 ```sh
 codesign --display --verbose=2 paperless-llm
@@ -69,6 +69,8 @@ codesign --verify --deep --strict --verbose=2 PaperlessLLM.app
 xcrun stapler validate PaperlessLLM.app
 spctl --assess --type execute --verbose=4 PaperlessLLM.app
 ```
+
+The first three `codesign` checks must pass for both ad-hoc and Developer ID builds. `stapler` and `spctl` establish notarization/Gatekeeper trust and are expected to succeed only when Apple signing and notarization credentials were configured.
 
 For a signed Windows build, inspect both executable signatures from PowerShell after extracting the ZIP:
 

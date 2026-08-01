@@ -8,6 +8,7 @@ export const defaultSettings: AppSettings = {
   processing: {
     poll_interval_minutes: 5,
     max_documents_per_scan: null,
+    inference_concurrency: 1,
     review_mode: false,
     use_existing_correspondents_and_tags: true,
     process_only_tagged: false,

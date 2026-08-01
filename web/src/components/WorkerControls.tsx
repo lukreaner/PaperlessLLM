@@ -18,7 +18,7 @@ export function WorkerControls({ onChanged }: { onChanged?: () => void | Promise
         showToast("Processing resumed");
       } else {
         await api.pauseWorker();
-        showToast(status.worker.active_job || status.worker.scan_progress ? "Processing will pause after the current operation" : "Processing paused");
+        showToast(status.worker.active_jobs?.length || status.worker.active_job || status.worker.scan_progress ? "Processing will pause after the current operation" : "Processing paused");
       }
       await refreshStatus();
       await onChanged?.();

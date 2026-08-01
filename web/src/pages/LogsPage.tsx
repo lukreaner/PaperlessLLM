@@ -32,20 +32,45 @@ function eventLabel(event: string) {
 }
 
 function fieldLabel(field: string) {
-  return field.replaceAll("_", " ");
+  const labels: Record<string, string> = {
+    api_family: "API family",
+    error_code: "Error class",
+    input_tokens: "Input tokens",
+    job_id: "Job ID",
+    latency_ms: "Latency (ms)",
+    output_tokens: "Output tokens",
+    timed_out: "Timed out",
+    total_tokens: "Total tokens",
+    upstream_status: "Upstream HTTP",
+  };
+  return labels[field] ?? field.replaceAll("_", " ");
+}
+
+function fieldValue(field: string, value: string) {
+  if (field === "api_family") {
+    if (value === "responses") return "Responses API";
+    if (value === "chat_completions") return "Chat Completions";
+    if (value === "messages") return "Anthropic Messages";
+  }
+  if (field === "timed_out") return value === "true" ? "Yes" : "No";
+  return value;
 }
 
 function workerLabel(
   state: "running" | "scanning" | "pausing" | "paused" | "error" | "unknown",
   active: boolean,
+  activeCount: number,
   scanDiscovered?: number,
   scanQueued?: number,
 ) {
   if (state === "paused") return "Paused";
   if (state === "pausing") {
-    return scanDiscovered === undefined || scanQueued === undefined
-      ? "Finishing current document"
-      : `Finishing current scan · ${scanDiscovered.toLocaleString()} discovered, ${scanQueued.toLocaleString()} queued`;
+    if (scanDiscovered !== undefined && scanQueued !== undefined) {
+      return `Finishing current scan · ${scanDiscovered.toLocaleString()} discovered, ${scanQueued.toLocaleString()} queued`;
+    }
+    if (activeCount > 1) return `Finishing ${activeCount.toLocaleString()} documents`;
+    if (activeCount === 1 || active) return "Finishing current document";
+    return "Pausing";
   }
   if (state === "scanning") {
     return scanDiscovered === undefined || scanQueued === undefined
@@ -53,6 +78,7 @@ function workerLabel(
       : `Scanning Paperless · ${scanDiscovered.toLocaleString()} discovered, ${scanQueued.toLocaleString()} queued`;
   }
   if (state === "error") return "Needs attention";
+  if (activeCount > 1) return `Processing ${activeCount.toLocaleString()} documents`;
   if (active) return "Processing a document";
   return state === "running" ? "Ready" : "State unavailable";
 }
@@ -100,7 +126,7 @@ export function LogsPage() {
         <Card className={`diagnostic-worker diagnostic-worker--${logs.data.worker.state}`}>
           <div className="diagnostic-worker__state">
             <StatusDot state={logs.data.worker.state === "error" ? "danger" : logs.data.worker.state === "running" || logs.data.worker.state === "scanning" ? "success" : logs.data.worker.state === "paused" || logs.data.worker.state === "pausing" ? "warning" : "neutral"} />
-            <div><span>Worker</span><strong>{workerLabel(logs.data.worker.state, logs.data.worker.active, logs.data.worker.scan_discovered, logs.data.worker.scan_queued)}</strong></div>
+            <div><span>Worker</span><strong>{workerLabel(logs.data.worker.state, logs.data.worker.active, logs.data.worker.active_count, logs.data.worker.scan_discovered, logs.data.worker.scan_queued)}</strong></div>
           </div>
           <div><span>Last scan</span><strong>{logs.data.worker.last_scan_at ? formatDateTime(logs.data.worker.last_scan_at) : "Not yet"}</strong></div>
           <div><span>Next scan</span><strong>{logs.data.worker.next_scan_at ? formatDateTime(logs.data.worker.next_scan_at) : "Not scheduled"}</strong></div>
@@ -151,7 +177,7 @@ export function LogsPage() {
                     <code title={entry.event}>{eventLabel(entry.event)}</code>
                     {Object.keys(entry.fields).length > 0 && (
                       <dl>{Object.entries(entry.fields).map(([key, value]) => (
-                        <div key={key} className={key === "detail" ? "diagnostic-log__detail" : undefined}><dt>{fieldLabel(key)}</dt><dd>{value}</dd></div>
+                        <div key={key} className={key === "detail" ? "diagnostic-log__detail" : undefined}><dt>{fieldLabel(key)}</dt><dd>{fieldValue(key, value)}</dd></div>
                       ))}</dl>
                     )}
                   </div>

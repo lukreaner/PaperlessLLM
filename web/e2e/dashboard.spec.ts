@@ -28,7 +28,7 @@ const provider: ProviderProfile = {
 
 function status(setupRequired = false, authenticated = true) {
   return {
-    version: "0.1.0",
+    version: "0.1.1",
     setup_required: setupRequired,
     worker: { state: "running" as const, last_scan_at: now, next_scan_at: now },
     paperless: { state: "connected" as const, message: "Paperless connected" },
@@ -126,6 +126,9 @@ test("first-run wizard tests both connections and reaches the dashboard", async 
   await page.getByRole("button", { name: "Test provider" }).click();
   await expect(page.getByText("Connection works")).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.locator(".workflow-mode-status")).toContainText("Automatic mode selected. It will become active when you finish setup.");
+  await page.getByRole("radio", { name: /^Review before applying/ }).click();
+  await expect(page.locator(".workflow-mode-status")).toContainText("Review mode selected. It will become active when you finish setup.");
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("button", { name: "Finish setup" }).click();
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
@@ -297,11 +300,12 @@ test("settings preserve an invalid draft and persist it after validation succeed
   expect(settings.limits.max_input_tokens).toBe(64000);
 });
 
-test("processing mode persists and a larger token budget resumes a blocked job", async ({ page }) => {
+test("processing mode and parallel AI limit persist while a larger token budget resumes a blocked job", async ({ page }) => {
   let settings = configuredBootstrap().settings;
   settings.limits.global_budget = { daily: 10_000, monthly: 50_000 };
   let jobState: "budget_blocked" | "queued" = "budget_blocked";
   const persistedReviewModes: boolean[] = [];
+  const persistedConcurrency: number[] = [];
   const currentStatus = () => ({
     ...status(),
     queue: {
@@ -325,6 +329,7 @@ test("processing mode persists and a larger token budget resumes a blocked job",
       const previousDailyLimit = settings.limits.global_budget.daily ?? 0;
       settings = request.postDataJSON() as AppSettings;
       persistedReviewModes.push(settings.processing.review_mode);
+      persistedConcurrency.push(settings.processing.inference_concurrency);
       if ((settings.limits.global_budget.daily ?? 0) > previousDailyLimit) jobState = "queued";
       return json(route, settings);
     }
@@ -336,17 +341,29 @@ test("processing mode persists and a larger token budget resumes a blocked job",
   await page.getByRole("link", { name: "Settings" }).click();
   await page.getByRole("button", { name: /Processing/ }).click();
 
-  const applyBehavior = page.getByLabel("Apply behavior");
-  await expect(applyBehavior).toHaveValue("automatic");
-  await applyBehavior.selectOption("review");
+  const automaticMode = page.getByRole("radio", { name: /^Automatic/ });
+  const reviewMode = page.getByRole("radio", { name: /^Review before applying/ });
+  const concurrency = page.getByLabel("Parallel AI analyses");
+  await expect(automaticMode).toHaveAttribute("aria-checked", "true");
+  await expect(page.locator(".workflow-mode-status")).toContainText("Automatic mode is active.");
+  await expect(concurrency).toHaveValue("1");
+  await concurrency.fill("4");
+  await reviewMode.click();
+  await expect(page.locator(".workflow-mode-status")).toContainText("Review mode selected — save changes to activate it. Automatic mode remains active until you save.");
   await page.getByRole("button", { name: "Save changes" }).first().click();
   await expect.poll(() => persistedReviewModes).toEqual([true]);
-  await expect(applyBehavior).toHaveValue("review");
+  await expect.poll(() => persistedConcurrency).toEqual([4]);
+  await expect(reviewMode).toHaveAttribute("aria-checked", "true");
+  await expect(page.locator(".workflow-mode-status")).toContainText("Review mode is active.");
 
-  await applyBehavior.selectOption("automatic");
+  await concurrency.fill("12");
+  await expect(concurrency).toHaveValue("8");
+  await automaticMode.click();
+  await expect(page.locator(".workflow-mode-status")).toContainText("Automatic mode selected — save changes to activate it. Review mode remains active until you save.");
   await page.getByRole("button", { name: "Save changes" }).first().click();
   await expect.poll(() => persistedReviewModes).toEqual([true, false]);
-  await expect(applyBehavior).toHaveValue("automatic");
+  await expect.poll(() => persistedConcurrency).toEqual([4, 8]);
+  await expect(automaticMode).toHaveAttribute("aria-checked", "true");
 
   await page.getByRole("button", { name: /Limits & Files/ }).click();
   await page.getByLabel("All providers daily budget").fill("20000");
@@ -357,6 +374,7 @@ test("processing mode persists and a larger token budget resumes a blocked job",
   await expect(page.locator(".badge", { hasText: "Queued" })).toBeVisible();
   await expect(page.locator(".badge", { hasText: "Budget Blocked" })).toHaveCount(0);
   expect(settings.processing.review_mode).toBe(false);
+  expect(settings.processing.inference_concurrency).toBe(8);
   expect(settings.limits.global_budget.daily).toBe(20_000);
 });
 

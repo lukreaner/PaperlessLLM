@@ -12,7 +12,7 @@ Before exposing the dashboard:
 4. Allow only the intended network at the firewall or VPN layer.
 5. Do not put Paperless or AI provider tokens in proxy configuration, URLs, or access logs.
 
-The `/healthz` route intentionally remains unauthenticated and contains only minimal health state. Do not treat it as an application API.
+The `/healthz` route intentionally remains unauthenticated and contains only service status, semantic version, and opaque build/data-directory fingerprints used by the desktop launcher. It contains no configuration or credentials. Do not treat it as an application API.
 
 ## Caddy
 

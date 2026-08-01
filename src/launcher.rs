@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::{
-    AppError, AppResult, RuntimeOptions,
+    AppError, AppResult, BUILD_ID, RuntimeOptions,
     app::{ensure_private_data_dir, instance_fingerprint, open_browser_now},
     diagnostics::validate_desktop_log_paths,
 };
@@ -21,6 +21,7 @@ const STARTUP_POLL: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceHealth {
     Matching,
+    DifferentBuild,
     DifferentInstance,
     Unavailable,
 }
@@ -58,6 +59,9 @@ pub async fn launch_with_service_executable(
             ServiceHealth::Matching => {
                 return finish_launch(&options, &dashboard_url).await;
             }
+            ServiceHealth::DifferentBuild => {
+                return Err(build_conflict(&options, &dashboard_url).await);
+            }
             ServiceHealth::DifferentInstance => {
                 return Err(instance_conflict(&dashboard_url));
             }
@@ -74,6 +78,10 @@ pub async fn launch_with_service_executable(
             ServiceHealth::Matching => {
                 return finish_launch(&options, &dashboard_url).await;
             }
+            ServiceHealth::DifferentBuild => {
+                stop_child(&mut child);
+                return Err(build_conflict(&options, &dashboard_url).await);
+            }
             ServiceHealth::DifferentInstance => {
                 stop_child(&mut child);
                 return Err(instance_conflict(&dashboard_url));
@@ -87,6 +95,9 @@ pub async fn launch_with_service_executable(
                 match service_health(&client, &dashboard_url, &instance_id).await {
                     ServiceHealth::Matching => {
                         return finish_launch(&options, &dashboard_url).await;
+                    }
+                    ServiceHealth::DifferentBuild => {
+                        return Err(build_conflict(&options, &dashboard_url).await);
                     }
                     ServiceHealth::DifferentInstance => {
                         return Err(instance_conflict(&dashboard_url));
@@ -105,6 +116,10 @@ pub async fn launch_with_service_executable(
 
     match service_health(&client, &dashboard_url, &instance_id).await {
         ServiceHealth::Matching => return finish_launch(&options, &dashboard_url).await,
+        ServiceHealth::DifferentBuild => {
+            stop_child(&mut child);
+            return Err(build_conflict(&options, &dashboard_url).await);
+        }
         ServiceHealth::DifferentInstance => {
             stop_child(&mut child);
             return Err(instance_conflict(&dashboard_url));
@@ -130,6 +145,18 @@ fn stop_child(child: &mut Child) {
 fn instance_conflict(dashboard_url: &str) -> AppError {
     AppError::Conflict(format!(
         "another PaperlessLLM data directory is already served at {dashboard_url}; stop that process or choose another --port"
+    ))
+}
+
+async fn build_conflict(options: &RuntimeOptions, dashboard_url: &str) -> AppError {
+    // A stale desktop service can only be stopped from its own dashboard. Open
+    // it when normal launcher behavior permits so the recovery action is
+    // immediately reachable instead of being buried in a non-clickable alert.
+    if options.open_browser {
+        let _ = open_browser_now(dashboard_url).await;
+    }
+    AppError::Conflict(format!(
+        "a different PaperlessLLM version or build is already running at {dashboard_url} for this data directory. Open that dashboard, choose Quit PaperlessLLM at the bottom of the sidebar, then open this app again to finish the update"
     ))
 }
 
@@ -170,11 +197,15 @@ async fn service_health(
     {
         return ServiceHealth::Unavailable;
     }
-    if body.get("instance_id").and_then(Value::as_str) == Some(expected_instance_id) {
-        ServiceHealth::Matching
-    } else {
-        ServiceHealth::DifferentInstance
+    if body.get("instance_id").and_then(Value::as_str) != Some(expected_instance_id) {
+        return ServiceHealth::DifferentInstance;
     }
+    if body.get("version").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION"))
+        || body.get("build_id").and_then(Value::as_str) != Some(BUILD_ID)
+    {
+        return ServiceHealth::DifferentBuild;
+    }
+    ServiceHealth::Matching
 }
 
 fn spawn_service(options: &RuntimeOptions, service_executable: &Path) -> AppResult<Child> {
@@ -300,7 +331,12 @@ mod tests {
     async fn launch_reuses_healthy_service_without_spawning_another_process() {
         let directory = TempDir::new().unwrap();
         let instance_id = instance_fingerprint(directory.path()).unwrap();
-        let (port, server) = spawn_health_server(instance_id).await;
+        let (port, server) = spawn_health_server(
+            instance_id,
+            env!("CARGO_PKG_VERSION").to_owned(),
+            Some(BUILD_ID.to_owned()),
+        )
+        .await;
 
         launch(RuntimeOptions {
             data_dir: directory.path().to_path_buf(),
@@ -320,7 +356,12 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let other_directory = TempDir::new().unwrap();
         let other_instance_id = instance_fingerprint(other_directory.path()).unwrap();
-        let (port, server) = spawn_health_server(other_instance_id).await;
+        let (port, server) = spawn_health_server(
+            other_instance_id,
+            "different-version".to_owned(),
+            Some("different-build".to_owned()),
+        )
+        .await;
 
         let error = launch(RuntimeOptions {
             data_dir: directory.path().to_path_buf(),
@@ -340,7 +381,87 @@ mod tests {
         server.abort();
     }
 
-    async fn spawn_health_server(instance_id: String) -> (u16, tokio::task::JoinHandle<()>) {
+    #[tokio::test]
+    async fn launch_rejects_a_different_build_for_the_same_data_directory() {
+        let directory = TempDir::new().unwrap();
+        let instance_id = instance_fingerprint(directory.path()).unwrap();
+        let (port, server) = spawn_health_server(
+            instance_id,
+            env!("CARGO_PKG_VERSION").to_owned(),
+            Some("different-build".to_owned()),
+        )
+        .await;
+
+        let error = launch(RuntimeOptions {
+            data_dir: directory.path().to_path_buf(),
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            open_browser: false,
+        })
+        .await
+        .expect_err("a stale build must not be silently reused");
+
+        let message = error.to_string();
+        assert!(message.contains("different PaperlessLLM version or build"));
+        assert!(message.contains("Quit PaperlessLLM"));
+        assert!(message.contains("open this app again"));
+        assert!(!directory.path().join("paperless-llm.log").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_a_different_version_even_with_a_matching_build_id() {
+        let directory = TempDir::new().unwrap();
+        let instance_id = instance_fingerprint(directory.path()).unwrap();
+        let (port, server) =
+            spawn_health_server(instance_id, "999.0.0".to_owned(), Some(BUILD_ID.to_owned())).await;
+
+        let error = launch(RuntimeOptions {
+            data_dir: directory.path().to_path_buf(),
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            open_browser: false,
+        })
+        .await
+        .expect_err("a different version must not be silently reused");
+
+        assert!(error.to_string().contains("version or build"));
+        assert!(!directory.path().join("paperless-llm.log").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_a_legacy_health_response_without_a_build_id() {
+        let directory = TempDir::new().unwrap();
+        let instance_id = instance_fingerprint(directory.path()).unwrap();
+        let (port, server) =
+            spawn_health_server(instance_id, env!("CARGO_PKG_VERSION").to_owned(), None).await;
+
+        let error = launch(RuntimeOptions {
+            data_dir: directory.path().to_path_buf(),
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            open_browser: false,
+        })
+        .await
+        .expect_err("a service without a build identity must not be reused");
+
+        assert!(error.to_string().contains("Quit PaperlessLLM"));
+        assert!(!directory.path().join("paperless-llm.log").exists());
+        server.abort();
+    }
+
+    #[test]
+    fn build_id_is_a_sha256_fingerprint() {
+        assert_eq!(BUILD_ID.len(), 64);
+        assert!(BUILD_ID.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    async fn spawn_health_server(
+        instance_id: String,
+        version: String,
+        build_id: Option<String>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -350,13 +471,19 @@ mod tests {
                     "/healthz",
                     get(move || {
                         let instance_id = instance_id.clone();
+                        let version = version.clone();
+                        let build_id = build_id.clone();
                         async move {
-                            Json(json!({
+                            let mut health = json!({
                                 "instance_id": instance_id,
                                 "service": "paperless-llm",
                                 "status": "ok",
-                                "version": "test"
-                            }))
+                                "version": version
+                            });
+                            if let Some(build_id) = build_id {
+                                health["build_id"] = json!(build_id);
+                            }
+                            Json(health)
                         }
                     }),
                 ),
