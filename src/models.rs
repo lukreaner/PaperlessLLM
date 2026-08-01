@@ -193,6 +193,8 @@ pub struct UsageRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
+    pub instance_id: String,
+    pub service: &'static str,
     pub status: &'static str,
     pub version: &'static str,
 }

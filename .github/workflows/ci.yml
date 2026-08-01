@@ -44,6 +44,11 @@ jobs:
           npm run test --if-present
           npm run build
 
+      - name: Check packaging scripts
+        run: |
+          bash -n packaging/macos/create-app-bundle.sh
+          sh -n packaging/linux/install-desktop.sh
+
       - name: Install browser for dashboard tests
         working-directory: web
         run: npx playwright install --with-deps chromium
@@ -133,6 +138,25 @@ jobs:
       - name: Run target tests
         run: cargo test --locked --target "${{ matrix.target }}"
 
+      - name: Create and validate macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c '
+          import pathlib, tomllib
+          print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])
+          ')"
+          bundle="target/${{ matrix.target }}/release/PaperlessLLM.app"
+          packaging/macos/create-app-bundle.sh \
+            --binary "target/${{ matrix.target }}/release/paperless-llm" \
+            --version "$version" \
+            --build-version "$GITHUB_RUN_NUMBER" \
+            --output "$bundle"
+          plutil -lint "$bundle/Contents/Info.plist"
+          test "$(plutil -extract CFBundleExecutable raw "$bundle/Contents/Info.plist")" = "paperless-llm"
+          "$bundle/Contents/MacOS/paperless-llm" --help >/dev/null
+
       - name: Smoke test CLI and health endpoint
         shell: bash
         run: |
@@ -153,9 +177,11 @@ jobs:
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
+          healthy=false
           for attempt in {1..30}; do
             if curl --silent --show-error --fail http://127.0.0.1:18788/healthz >/dev/null; then
-              exit 0
+              healthy=true
+              break
             fi
             if ! kill -0 "$server_pid" 2>/dev/null; then
               cat "$log_file"
@@ -164,5 +190,39 @@ jobs:
             sleep 1
           done
 
-          cat "$log_file"
-          exit 1
+          if [[ "$healthy" != "true" ]]; then
+            cat "$log_file"
+            exit 1
+          fi
+
+          "$binary" launch \
+            --data-dir "$smoke_dir" \
+            --bind 127.0.0.1 \
+            --port 18788 \
+            --no-open
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            "target/${{ matrix.target }}/release/PaperlessLLM.app/Contents/MacOS/paperless-llm" launch \
+              --data-dir "$smoke_dir" \
+              --bind 127.0.0.1 \
+              --port 18788 \
+              --no-open
+          fi
+
+      - name: Validate Linux desktop installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/paperless-llm-desktop-${{ matrix.target }}"
+          user_root="$RUNNER_TEMP/paperless-llm-desktop-user-${{ matrix.target }}"
+          mkdir -p "$stage/packaging"
+          install -m 0755 "target/${{ matrix.target }}/release/paperless-llm" "$stage/paperless-llm"
+          cp -R packaging/linux "$stage/packaging/linux"
+          HOME="$user_root" \
+          XDG_DATA_HOME="$user_root/data" \
+          PAPERLESSLLM_BIN_DIR="$user_root/bin" \
+          PAPERLESSLLM_DESKTOP_DIR="$user_root/Desktop" \
+            "$stage/packaging/linux/install-desktop.sh" --desktop-shortcut
+          test -x "$user_root/bin/paperless-llm"
+          test -f "$user_root/data/applications/io.paperlessllm.PaperlessLLM.desktop"
+          test -x "$user_root/Desktop/PaperlessLLM.desktop"

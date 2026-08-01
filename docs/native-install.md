@@ -1,6 +1,6 @@
 # Native installation
 
-PaperlessLLM is distributed as one native executable with the dashboard and database migrations embedded. Node.js, Rust, and a container runtime are not required on the destination computer.
+PaperlessLLM contains one native service executable with the dashboard and database migrations embedded. Release archives also include platform launchers: `PaperlessLLM.app` for macOS and a freedesktop application-menu template and installer for Linux. Node.js, Rust, and a container runtime are not required on the destination computer.
 
 ## Choose and verify a release
 
@@ -23,7 +23,21 @@ On macOS, use `shasum -a 256` and compare its output with the corresponding line
 
 ## macOS
 
-Extract the archive, change into the extracted `paperless-llm-<version>-<target>` directory, then install the executable for the current user:
+### Double-click installation
+
+Extract the archive and double-click `PaperlessLLM.app`. You may first drag it to `/Applications` or `~/Applications` so it remains available after deleting the extracted archive. Each activation invokes `paperless-llm launch`: it starts the background service when needed, reuses an existing instance, and opens the dashboard in the default browser.
+
+If the browser does not open, visit `http://127.0.0.1:8765`. The first launch opens the setup wizard.
+
+Release automation signs the standalone CLI and app, submits both for notarization, and staples the app only when the project maintainers configure Apple credentials. For an unsigned build, verify the checksum and release source first. You may then right-click the app and choose **Open** to use macOS's confirmation flow. Removing quarantine is a separate, advanced option:
+
+```sh
+xattr -dr com.apple.quarantine PaperlessLLM.app
+```
+
+### Command-line installation
+
+The archive also contains the standalone executable. To install it for the current user:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
@@ -32,7 +46,13 @@ mkdir -p "$HOME/Library/Application Support/PaperlessLLM"
 chmod 700 "$HOME/Library/Application Support/PaperlessLLM"
 ```
 
-Run the first-start wizard in the foreground:
+For normal desktop-style launching from a terminal, run:
+
+```sh
+"$HOME/.local/bin/paperless-llm" launch
+```
+
+To run in the foreground instead:
 
 ```sh
 "$HOME/.local/bin/paperless-llm" serve \
@@ -42,9 +62,7 @@ Run the first-start wizard in the foreground:
   --open-browser
 ```
 
-If the browser does not open, visit `http://127.0.0.1:8765`. Stop the foreground process with Ctrl-C after setup.
-
-Release automation signs and notarizes macOS binaries only when the project maintainers configure Apple credentials. For an unsigned release, macOS may quarantine the executable. Verify the checksum and release source before deciding whether to remove the quarantine attribute with `xattr -d com.apple.quarantine "$HOME/.local/bin/paperless-llm"`.
+Stop the foreground process with Ctrl-C after setup. For an unsigned standalone executable, macOS may also require confirmation or removal of its quarantine attribute after verification.
 
 ### Start at login with launchd
 
@@ -80,7 +98,31 @@ launchctl kickstart -k "gui/$(id -u)/io.paperlessllm.paperless-llm"
 
 ## Linux
 
-The Linux archives target musl and do not require a matching glibc version. Install for the current user:
+The Linux archives target musl and do not require a matching glibc version.
+
+### Application-menu and double-click installation
+
+From the extracted `paperless-llm-<version>-<target>` directory, run the included current-user installer:
+
+```sh
+./packaging/linux/install-desktop.sh
+```
+
+It atomically installs the executable at `$HOME/.local/bin/paperless-llm`, creates the private data directory, and writes `io.paperlessllm.PaperlessLLM.desktop` under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`. Open **PaperlessLLM** from the desktop environment's application menu. The menu entry runs `paperless-llm launch`, which starts or reuses the background service and opens the dashboard.
+
+To also create an executable shortcut in the desktop directory, run:
+
+```sh
+./packaging/linux/install-desktop.sh --desktop-shortcut
+```
+
+Double-click `PaperlessLLM.desktop` after installation. GNOME Files and some other file managers may show an **Allow Launching** or **Trust and Launch** confirmation the first time. The installer uses `xdg-user-dir` when available so localized desktop-directory names are supported; set `PAPERLESSLLM_DESKTOP_DIR` to an absolute path to override its choice.
+
+The installer never uses `sudo` and only changes the current user's files. It honors `XDG_DATA_HOME`; `PAPERLESSLLM_BIN_DIR` can override the binary destination. Re-run the installer from a newer extracted archive to upgrade both the binary and application entry.
+
+### Manual command-line installation
+
+To install without an application-menu entry:
 
 ```sh
 install -d -m 0755 "$HOME/.local/bin"
@@ -88,7 +130,13 @@ install -m 0755 paperless-llm "$HOME/.local/bin/paperless-llm"
 install -d -m 0700 "$HOME/.local/share/paperless-llm"
 ```
 
-Run the first-start wizard:
+Start or open PaperlessLLM:
+
+```sh
+"$HOME/.local/bin/paperless-llm" launch
+```
+
+For foreground operation instead:
 
 ```sh
 "$HOME/.local/bin/paperless-llm" serve \
@@ -121,6 +169,16 @@ sudo loginctl enable-linger "$USER"
 
 View logs with `journalctl --user -u paperless-llm.service -f`.
 
+## Stop a desktop-launched service
+
+Closing the browser does not stop PaperlessLLM; the worker intentionally remains active. Before upgrading or uninstalling a copy started with `launch` or by double-clicking, stop the `paperless-llm` process in macOS Activity Monitor or the Linux system monitor. On Linux, the equivalent terminal command is:
+
+```sh
+pkill -TERM -x paperless-llm
+```
+
+For a managed service, use `launchctl bootout` or `systemctl --user stop paperless-llm.service` instead. Double-clicking the app or choosing the application-menu entry starts it again.
+
 ## Initial configuration
 
 The setup wizard needs:
@@ -136,4 +194,11 @@ Keep the service on `127.0.0.1` for a single-machine installation. Before making
 
 Back up the data directory before an upgrade. Stop the service, replace only the executable, and start it again; embedded database migrations run at startup. Database migrations are forward-only, so keep the matching backup until the new version has been verified.
 
-Uninstalling the executable does not remove configuration or statistics. Delete the data directory only when those records and encrypted credentials are no longer needed.
+Uninstalling the executable does not remove configuration or statistics. A Linux application-menu installation can be removed with:
+
+```sh
+rm "$HOME/.local/bin/paperless-llm"
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.paperlessllm.PaperlessLLM.desktop"
+```
+
+Remove a separately created `PaperlessLLM.desktop` shortcut from the desktop in the usual file-manager way. Delete the data directory only when its configuration, statistics, and encrypted credentials are no longer needed.

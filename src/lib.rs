@@ -4,6 +4,7 @@ pub mod auth;
 pub mod budget;
 pub mod db;
 pub mod error;
+pub mod launcher;
 pub mod models;
 pub mod paperless;
 pub mod provider_factory;

@@ -7,7 +7,7 @@ The release workflow produces four native archives and `SHA256SUMS` from an exis
 - `aarch64-unknown-linux-musl`
 - `x86_64-unknown-linux-musl`
 
-Each target runs on a native GitHub-hosted runner. The workflow installs and builds `web/` before compiling Rust so the dashboard is embedded in the executable, runs Rust tests, starts the release binary, and checks `/healthz`. Before tagging, main CI also runs the committed Playwright Chromium suite for setup, review, activity/statistics, budget-paused, and LAN-authentication flows. Archives contain the executable, license, operational documentation, and native service templates. No container image is built or published.
+Each target runs on a native GitHub-hosted runner. The workflow installs and builds `web/` before compiling Rust so the dashboard is embedded in the executable, runs Rust tests, starts the release binary, and checks `/healthz`. Before tagging, main CI also runs the committed Playwright Chromium suite for setup, review, activity/statistics, budget-paused, and LAN-authentication flows. Archives contain the executable, license, operational documentation, and native service templates; macOS archives also contain `PaperlessLLM.app`. No container image is built or published.
 
 ## Create a release
 
@@ -20,7 +20,7 @@ The workflow can also be dispatched manually for an existing tag. Re-running it 
 
 ## Optional Apple signing and notarization
 
-Without signing secrets, the workflow deliberately publishes unsigned macOS binaries. Configure all signing secrets to enable hardened-runtime signing:
+Without signing secrets, the workflow deliberately publishes unsigned macOS deliverables. Configure all signing secrets to enable hardened-runtime signing of the standalone CLI and app bundle:
 
 | Repository secret | Value |
 | --- | --- |
@@ -30,7 +30,7 @@ Without signing secrets, the workflow deliberately publishes unsigned macOS bina
 
 The temporary signing keychain and certificate file are removed after each job.
 
-Configure these additional secrets to submit signed binaries to Apple's notary service:
+Configure these additional secrets to submit the signed CLI and app to Apple's notary service and staple the accepted ticket to the app:
 
 | Repository secret | Value |
 | --- | --- |
@@ -48,11 +48,14 @@ Download every asset and run:
 sha256sum --check SHA256SUMS
 ```
 
-For macOS signed builds, also inspect and verify both archives after extraction:
+For macOS signed builds, inspect the standalone CLI and verify the app after extraction:
 
 ```sh
 codesign --display --verbose=2 paperless-llm
 codesign --verify --strict --verbose=2 paperless-llm
+codesign --verify --deep --strict --verbose=2 PaperlessLLM.app
+xcrun stapler validate PaperlessLLM.app
+spctl --assess --type execute --verbose=4 PaperlessLLM.app
 ```
 
 Start each binary with a temporary data directory and verify `http://127.0.0.1:8765/healthz` before announcing the release.

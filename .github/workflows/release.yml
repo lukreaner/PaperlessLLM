@@ -97,6 +97,21 @@ jobs:
           cargo test --locked --target "${{ matrix.target }}"
           cargo build --locked --release --target "${{ matrix.target }}"
 
+      - name: Create and validate macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="target/${{ matrix.target }}/release/PaperlessLLM.app"
+          packaging/macos/create-app-bundle.sh \
+            --binary "target/${{ matrix.target }}/release/paperless-llm" \
+            --version "${RELEASE_TAG#v}" \
+            --build-version "$GITHUB_RUN_NUMBER" \
+            --output "$bundle"
+          plutil -lint "$bundle/Contents/Info.plist"
+          test "$(plutil -extract CFBundleExecutable raw "$bundle/Contents/Info.plist")" = "paperless-llm"
+          "$bundle/Contents/MacOS/paperless-llm" --help >/dev/null
+
       - name: Smoke test CLI and health endpoint
         shell: bash
         run: |
@@ -117,9 +132,11 @@ jobs:
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
 
+          healthy=false
           for attempt in {1..30}; do
             if curl --silent --show-error --fail http://127.0.0.1:18788/healthz >/dev/null; then
-              exit 0
+              healthy=true
+              break
             fi
             if ! kill -0 "$server_pid" 2>/dev/null; then
               cat "$log_file"
@@ -128,8 +145,42 @@ jobs:
             sleep 1
           done
 
-          cat "$log_file"
-          exit 1
+          if [[ "$healthy" != "true" ]]; then
+            cat "$log_file"
+            exit 1
+          fi
+
+          "$binary" launch \
+            --data-dir "$smoke_dir" \
+            --bind 127.0.0.1 \
+            --port 18788 \
+            --no-open
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            "target/${{ matrix.target }}/release/PaperlessLLM.app/Contents/MacOS/paperless-llm" launch \
+              --data-dir "$smoke_dir" \
+              --bind 127.0.0.1 \
+              --port 18788 \
+              --no-open
+          fi
+
+      - name: Validate Linux desktop installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/paperless-llm-desktop-${{ matrix.target }}"
+          user_root="$RUNNER_TEMP/paperless-llm-desktop-user-${{ matrix.target }}"
+          mkdir -p "$stage/packaging"
+          install -m 0755 "target/${{ matrix.target }}/release/paperless-llm" "$stage/paperless-llm"
+          cp -R packaging/linux "$stage/packaging/linux"
+          HOME="$user_root" \
+          XDG_DATA_HOME="$user_root/data" \
+          PAPERLESSLLM_BIN_DIR="$user_root/bin" \
+          PAPERLESSLLM_DESKTOP_DIR="$user_root/Desktop" \
+            "$stage/packaging/linux/install-desktop.sh" --desktop-shortcut
+          test -x "$user_root/bin/paperless-llm"
+          test -f "$user_root/data/applications/io.paperlessllm.PaperlessLLM.desktop"
+          test -x "$user_root/Desktop/PaperlessLLM.desktop"
 
       - name: Check optional Apple credentials
         id: apple_credentials
@@ -199,7 +250,7 @@ jobs:
           security list-keychains -d user -s "$keychain_path"
           rm -f "$certificate_path"
 
-      - name: Sign macOS binary
+      - name: Sign macOS CLI and app bundle
         if: runner.os == 'macOS' && steps.apple_credentials.outputs.signing == 'true'
         shell: bash
         env:
@@ -207,6 +258,8 @@ jobs:
         run: |
           set -euo pipefail
           binary="target/${{ matrix.target }}/release/paperless-llm"
+          bundle="target/${{ matrix.target }}/release/PaperlessLLM.app"
+          bundle_binary="$bundle/Contents/MacOS/paperless-llm"
           codesign \
             --force \
             --options runtime \
@@ -216,7 +269,24 @@ jobs:
             "$binary"
           codesign --verify --strict --verbose=2 "$binary"
 
-      - name: Notarize macOS binary
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --keychain "$PAPERLESS_LLM_SIGNING_KEYCHAIN" \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            "$bundle_binary"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --keychain "$PAPERLESS_LLM_SIGNING_KEYCHAIN" \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            "$bundle"
+          codesign --verify --strict --verbose=2 "$bundle_binary"
+          codesign --verify --deep --strict --verbose=2 "$bundle"
+
+      - name: Notarize and staple macOS app bundle
         if: runner.os == 'macOS' && steps.apple_credentials.outputs.notarization == 'true'
         shell: bash
         env:
@@ -226,14 +296,24 @@ jobs:
         run: |
           set -euo pipefail
           binary="target/${{ matrix.target }}/release/paperless-llm"
+          bundle="target/${{ matrix.target }}/release/PaperlessLLM.app"
+          notary_payload="$RUNNER_TEMP/paperless-llm-${{ matrix.target }}-notary"
           notary_archive="$RUNNER_TEMP/paperless-llm-${{ matrix.target }}-notary.zip"
-          ditto -c -k --keepParent "$binary" "$notary_archive"
+          mkdir -p "$notary_payload"
+          ditto "$bundle" "$notary_payload/PaperlessLLM.app"
+          ditto "$binary" "$notary_payload/paperless-llm"
+          ditto -c -k --sequesterRsrc --keepParent "$notary_payload" "$notary_archive"
           xcrun notarytool submit "$notary_archive" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --wait
+          xcrun stapler staple "$bundle"
+          xcrun stapler validate "$bundle"
+          codesign --verify --deep --strict --verbose=2 "$bundle"
+          spctl --assess --type execute --verbose=4 "$bundle"
           rm -f "$notary_archive"
+          rm -rf "$notary_payload"
 
       - name: Create release archive
         shell: bash
@@ -245,6 +325,10 @@ jobs:
           mkdir -p "$stage"
 
           install -m 0755 "target/${{ matrix.target }}/release/paperless-llm" "$stage/paperless-llm"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            ditto "target/${{ matrix.target }}/release/PaperlessLLM.app" "$stage/PaperlessLLM.app"
+            test -x "$stage/PaperlessLLM.app/Contents/MacOS/paperless-llm"
+          fi
           cp LICENSE "$stage/LICENSE"
           cp -R docs "$stage/docs"
           cp -R packaging "$stage/packaging"

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PaperlessLLM
+GenericName=Paperless-ngx AI Sidecar
+Comment=Start PaperlessLLM and open its dashboard
+Exec=__PAPERLESS_LLM_EXEC__ launch
+Terminal=false
+Categories=Office;Utility;
+Keywords=Paperless;Paperless-ngx;Documents;AI;
+StartupNotify=false

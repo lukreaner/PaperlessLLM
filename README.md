@@ -2,7 +2,7 @@
 
 PaperlessLLM is a self-contained AI metadata sidecar for Paperless-ngx v3. It polls Paperless through REST API v10, analyzes documents with a selected AI provider, and either applies conservative metadata updates or holds editable suggestions for review.
 
-The production artifact is one native executable. The Rust service, worker, SQLite migrations, and React dashboard are embedded together; Node.js is needed only when building from source. PaperlessLLM does not retain document text or files.
+The service runtime is one native executable. The Rust service, worker, SQLite migrations, and React dashboard are embedded together; Node.js is needed only when building from source. Release archives also provide native launchers: `PaperlessLLM.app` on macOS and an installable application-menu entry on Linux. PaperlessLLM does not retain document text or files.
 
 ## Highlights
 
@@ -17,6 +17,7 @@ The production artifact is one native executable. The Rust service, worker, SQLi
 - Atomic daily/monthly token budgets with provider-specific limits and reset timezones
 - macOS Keychain storage or AES-GCM-encrypted Linux secret storage
 - Authenticated LAN/reverse-proxy mode with Argon2id, HttpOnly sessions, CSRF protection, and restrictive browser headers
+- Double-click launching through a macOS app bundle or Linux application-menu/desktop entry
 - Native macOS ARM/x64 and Linux ARM/x64 release workflows; no container artifacts
 
 ## Requirements
@@ -30,9 +31,31 @@ The production artifact is one native executable. The Rust service, worker, SQLi
 
 API keys are entered in the first-run wizard and are never returned to the browser after storage.
 
-## Run a release binary
+## Run a release
 
-Download the archive for your platform, verify it against `SHA256SUMS`, then run:
+Download the archive for your platform and verify it against `SHA256SUMS` before extracting it.
+
+On macOS, move `PaperlessLLM.app` to Applications if desired, then double-click it. On Linux, run the included current-user installer once:
+
+```sh
+./packaging/linux/install-desktop.sh
+```
+
+Then choose **PaperlessLLM** from the application menu. To also create a desktop icon that can be double-clicked, use:
+
+```sh
+./packaging/linux/install-desktop.sh --desktop-shortcut
+```
+
+Both launchers run `paperless-llm launch`, which starts the local service when needed, reuses it when already running, and opens the dashboard. The same behavior is available from a terminal:
+
+```sh
+paperless-llm launch
+```
+
+The worker remains active after the browser closes. See [native installation](docs/native-install.md#stop-a-desktop-launched-service) for stopping it before an upgrade or uninstall.
+
+For foreground operation or service-manager integration, run:
 
 ```sh
 paperless-llm serve --open-browser
@@ -48,7 +71,7 @@ The default dashboard is `http://127.0.0.1:8765`. Useful options are:
 --no-open           Never open a browser
 ```
 
-See [native installation](docs/native-install.md) for platform installation, launchd, and systemd-user instructions.
+See [native installation](docs/native-install.md) for double-click setup, command-line installation, launchd, and systemd-user instructions.
 
 ## Build from source
 

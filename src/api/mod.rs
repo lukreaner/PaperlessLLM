@@ -73,8 +73,13 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(protected)
 }
 
-async fn healthz() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+async fn healthz(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "instance_id": state.instance_id.as_ref(),
+        "service": "paperless-llm",
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
 }
 
 async fn security_guard(
